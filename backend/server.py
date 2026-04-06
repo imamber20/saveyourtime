@@ -28,7 +28,7 @@ MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ.get("DB_NAME", "content_memory")
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGORITHM = "HS256"
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@example.com")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@example.com").lower().strip()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 logging.basicConfig(level=logging.INFO)
@@ -161,7 +161,7 @@ async def clear_failed_attempts(identifier: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, db
-    client = AsyncIOMotorClient(MONGO_URL)
+    client = AsyncIOMotorClient(MONGO_URL, tz_aware=True)
     db = client[DB_NAME]
 
     # Create indexes
