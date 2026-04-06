@@ -189,7 +189,7 @@ Return ONLY this exact JSON structure (all fields required):
   "sub_category": "More specific sub-category",
   "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"],
   "is_place_related": true or false,
-  "places": ["Specific Place Name 1", "Specific Place Name 2"],
+  "places": ["Place Name, City, Country (e.g. QLA, New Delhi, India)", "Place Name 2, City, Country"],
   "steps": ["Step 1: ...", "Step 2: ..."],
   "ingredients": ["ingredient with quantity 1", "ingredient 2"],
   "transcript_excerpt": "Most informative 2-3 sentences from the transcript (empty string if no transcript)",
@@ -200,7 +200,7 @@ Rules:
 - key_points: always 3-7 specific bullet points about the ACTUAL content (not generic filler)
 - steps: fill only if the video shows a how-to, recipe, tutorial, or workout routine; otherwise []
 - ingredients: fill only if the video shows food, recipes, or products; otherwise []
-- places: real, specific location names only (not generic like "kitchen" or "gym")
+- places: real, specific location names with city and country appended for accurate geocoding (e.g. "QLA, New Delhi, India" or "Eiffel Tower, Paris, France"). Never just a bare venue name — always include city/country context.
 - summary: must be detailed and specific, NOT generic. If it's a recipe, name the dish. If travel, name the destination. If fitness, name the workout.
 - transcript_excerpt: pick the most informative / dense part of the transcript"""
 

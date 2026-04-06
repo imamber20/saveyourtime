@@ -549,12 +549,14 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
                 {"item_id": item_id},
                 {"$set": {"step_name": "geocoding"}}
             )
-            for place_name in ai_result["places"][:5]:
-                coords = await geocode_place(place_name)
+            for place_entry in ai_result["places"][:5]:
+                # AI returns "Venue Name, City, Country" — use first part as display name
+                display_name = place_entry.split(",")[0].strip() if "," in place_entry else place_entry
+                coords = await geocode_place(place_entry)
                 if coords:
                     await db.places.insert_one({
                         "item_id": item_id,
-                        "name": place_name,
+                        "name": display_name,
                         "address": coords.get("address", ""),
                         "latitude": coords["lat"],
                         "longitude": coords["lon"],

@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { ExternalLink, CheckCircle, AlertCircle } from 'lucide-react';
+import { ExternalLink, CheckCircle, AlertCircle, RefreshCw } from 'lucide-react';
+import { itemsAPI } from '../services/api';
 
 const PLATFORM_COLORS = {
   instagram: 'bg-gradient-to-br from-purple-500 to-pink-500',
@@ -70,15 +71,31 @@ export function ProcessingCard({ item, index = 0 }) {
 }
 
 // ── Normal item card ──────────────────────────────────────────────────────────
-export default function ItemCard({ item, index = 0 }) {
+export default function ItemCard({ item, index = 0, onRetry }) {
   const navigate = useNavigate();
+  const [retrying, setRetrying] = useState(false);
+  const [localStatus, setLocalStatus] = useState(item.source_status);
 
   // Show skeleton while processing
-  if (item.source_status === 'processing') {
+  if (localStatus === 'processing') {
     return <ProcessingCard item={item} index={index} />;
   }
 
-  const isFailed = item.source_status === 'failed';
+  const isFailed = localStatus === 'failed';
+
+  const handleRetry = async (e) => {
+    e.stopPropagation();
+    setRetrying(true);
+    try {
+      await itemsAPI.retry(item.id);
+      setLocalStatus('processing');
+      onRetry?.();
+    } catch {
+      // silently ignore — item detail page shows error state
+    } finally {
+      setRetrying(false);
+    }
+  };
 
   return (
     <motion.div
@@ -107,8 +124,21 @@ export default function ItemCard({ item, index = 0 }) {
           </span>
         </div>
 
-        {/* Status badge */}
-        <div className="absolute top-3 right-3">
+        {/* Status + Reload button */}
+        <div className="absolute top-3 right-3 flex items-center gap-1.5">
+          {/* Reload button — always shown for failed, shown on hover for completed */}
+          <button
+            onClick={handleRetry}
+            disabled={retrying}
+            title="Reload & reprocess"
+            className={`p-1 rounded-full bg-black/40 backdrop-blur-sm transition-all ${
+              isFailed
+                ? 'opacity-100'
+                : 'opacity-0 group-hover:opacity-100'
+            } hover:bg-black/60 disabled:opacity-50`}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 text-white ${retrying ? 'animate-spin' : ''}`} />
+          </button>
           {isFailed ? (
             <AlertCircle className="w-4 h-4 text-red-400" />
           ) : (
