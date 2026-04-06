@@ -26,6 +26,10 @@ _UNAVAILABLE_PATTERNS = [
     "account has been disabled", "page not found", "sorry, this page isn't available",
     "does not exist", "post unavailable", "sorry, this reel", "reel not found",
     "video does not exist", "removed by", "not available in your country",
+    # Instagram-specific
+    "http error 404", "404 not found", "this post is unavailable",
+    "media not found", "unable to extract", "this account doesn't exist",
+    "sorry, this content", "this page isn't available",
 ]
 
 # Find yt-dlp: check user bin, then venv, then PATH
@@ -85,28 +89,77 @@ def detect_platform(url: str) -> Optional[str]:
 # ─── Metadata Extraction ─────────────────────────────────────────────────────
 async def quick_availability_check(url: str) -> dict:
     """Fast pre-check: run yt-dlp --print title (no download, 10s timeout).
+    Runs yt-dlp in a thread pool so the async event loop stays unblocked.
     Returns {"available": bool, "title": str, "reason": str}
     """
-    try:
-        result = subprocess.run(
+    import asyncio, functools
+
+    loop = asyncio.get_event_loop()
+    def _run_ytdlp():
+        return subprocess.run(
             [YTDLP_PATH, "--print", "title", "--no-download", "--no-playlist",
              "--socket-timeout", "8", url],
             capture_output=True, text=True, timeout=12
         )
+
+    try:
+        result = await loop.run_in_executor(None, _run_ytdlp)
         # Only check stderr for definitive removal signals (stdout contains the title)
         stderr_lower = result.stderr.lower()
         if result.returncode != 0 and any(p in stderr_lower for p in _UNAVAILABLE_PATTERNS):
             return {"available": False, "title": "", "reason": "Content removed or no longer accessible"}
         if result.returncode == 0:
             return {"available": True, "title": result.stdout.strip(), "reason": ""}
-        # Non-zero but no unavailable pattern — SSL warning, network blip, unsupported variant
-        # Pass through so the full pipeline can handle it
-        return {"available": True, "title": "", "reason": "passthrough"}
+        # Non-zero but no unavailable pattern — SSL warning, network blip, etc.
+        # Do a quick HTTP og:meta check before passing through.
+        return await _http_page_check(url)
     except subprocess.TimeoutExpired:
-        # Timeout ≠ unavailable — just a slow network; let the full pipeline decide
         return {"available": True, "title": "", "reason": "timeout"}
     except Exception as e:
         return {"available": True, "title": "", "reason": str(e)}
+
+
+async def _http_page_check(url: str) -> dict:
+    """HTTP GET fallback: parse og:* meta tags to detect deleted/private content.
+
+    Instagram (and most platforms) injects rich og:title + og:image for real posts.
+    Deleted or private posts return HTTP 200 but with a generic/absent og:title and
+    no og:image thumbnail — a reliable signal the content is gone.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=8) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code in (404, 410):
+                return {"available": False, "title": "", "reason": f"HTTP {resp.status_code}"}
+            if resp.status_code != 200:
+                return {"available": True, "title": "", "reason": "passthrough"}
+
+            # Plain-text pattern check (works for platforms that render server-side)
+            page_lower = resp.text.lower()
+            if any(p in page_lower for p in _UNAVAILABLE_PATTERNS):
+                return {"available": False, "title": "", "reason": "Content not found or removed"}
+
+            # og:meta check — deleted Instagram/Facebook posts lack a real og:title/og:image
+            soup = BeautifulSoup(resp.text, "lxml")
+            og_title_tag = soup.find("meta", attrs={"property": "og:title"})
+            og_image_tag = soup.find("meta", attrs={"property": "og:image"})
+            og_title = (og_title_tag.get("content", "") if og_title_tag else "").strip()
+            og_image = (og_image_tag.get("content", "") if og_image_tag else "").strip()
+
+            # A real post has a meaningful title (not just the brand name) and a thumbnail
+            title_is_generic = not og_title or og_title.lower() in _GENERIC_TITLES
+            image_is_absent = not og_image or "/static/" in og_image or "instagram_logo" in og_image
+
+            if title_is_generic and image_is_absent:
+                return {"available": False, "title": "", "reason": "Content not found or removed"}
+
+    except Exception:
+        pass
+    return {"available": True, "title": "", "reason": "passthrough"}
 
 
 async def extract_metadata(url: str, platform: str) -> Dict:
@@ -132,6 +185,8 @@ async def extract_metadata(url: str, platform: str) -> Dict:
     if not metadata.get("title") and not metadata.get("description"):
         try:
             metadata = await extract_opengraph_metadata(url, metadata)
+        except ContentUnavailableError:
+            raise  # propagate — page confirmed content is gone
         except Exception as e:
             logger.warning(f"OpenGraph fallback also failed for {url}: {e}")
 
@@ -204,6 +259,9 @@ async def _extract_ytdlp_metadata(url: str, metadata: Dict) -> Dict:
     return metadata
 
 
+# Platform brand names that appear as the page title when content is unavailable
+_GENERIC_TITLES = {"instagram", "facebook", "youtube", "meta", "tiktok", "fb"}
+
 async def extract_opengraph_metadata(url: str, metadata: Dict) -> Dict:
     """Extract OpenGraph metadata as fallback."""
     headers = {
@@ -213,6 +271,10 @@ async def extract_opengraph_metadata(url: str, metadata: Dict) -> Dict:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
+                # Instagram/Facebook return HTTP 200 even for deleted posts — check page text
+                page_text_lower = resp.text.lower()
+                if any(p in page_text_lower for p in _UNAVAILABLE_PATTERNS):
+                    raise ContentUnavailableError(f"Page indicates content unavailable: {url}")
                 soup = BeautifulSoup(resp.text, "lxml")
 
                 og_title = soup.find("meta", property="og:title")
@@ -247,6 +309,10 @@ async def extract_opengraph_metadata(url: str, metadata: Dict) -> Dict:
                         metadata.setdefault("thumbnail_urls", []).insert(0, image)
     except Exception as e:
         logger.warning(f"OpenGraph extraction failed for {url}: {e}")
+
+    # Strip generic platform titles — these appear when the post is gone
+    if metadata.get("title", "").lower().strip() in _GENERIC_TITLES:
+        metadata["title"] = ""
 
     return metadata
 

@@ -500,6 +500,14 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
             "updated_at": datetime.now(timezone.utc)
         }})
 
+        # Guard: if extraction yielded nothing at all, treat as unavailable rather
+        # than letting the AI hallucinate content from thin air.
+        if (not metadata.get("title") and not metadata.get("description")
+                and not metadata.get("thumbnail_url")):
+            raise ContentUnavailableError(
+                f"No content could be extracted from {url} — post may be deleted, private, or login-gated"
+            )
+
         # ── Step 2: Vision analysis — send thumbnail frames to GPT-4o ───────
         visual_text = ""
         thumb_urls = metadata.get("thumbnail_urls", [])
