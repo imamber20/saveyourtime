@@ -19,9 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
-from services.extraction import validate_url, detect_platform, extract_metadata
+from services.extraction import validate_url, detect_platform, extract_metadata, ContentUnavailableError
 from services.ai_service import categorize_content
 from services.geocoding import geocode_place
+
+MAX_RETRIES = 3  # hard cap on how many times a single item can be reprocessed
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 MONGO_URL = os.environ["MONGO_URL"]
@@ -384,6 +386,7 @@ async def save_url(req: SaveRequest, background_tasks: BackgroundTasks, user: di
         "is_place_related": False,
         "confidence_score": 0.0,
         "notes": "",
+        "retry_count": 0,
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc)
     }
@@ -519,7 +522,7 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
             {"item_id": item_id},
             {"$set": {"step_name": "ai_categorization"}}
         )
-        ai_result = await categorize_content(metadata)
+        ai_result = await asyncio.wait_for(categorize_content(metadata), timeout=60)
         logger.info(f"AI done for {item_id}: category={ai_result.get('category')}, "
                     f"key_points={len(ai_result.get('key_points', []))}, "
                     f"steps={len(ai_result.get('steps', []))}")
@@ -574,7 +577,17 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
         )
         logger.info(f"Processing complete for item {item_id}")
 
-    except Exception as e:
+    except ContentUnavailableError as e:
+        logger.warning(f"Content unavailable for {item_id}: {e}")
+        await db.items.update_one(
+            {"_id": ObjectId(item_id)},
+            {"$set": {"source_status": "unavailable", "updated_at": datetime.now(timezone.utc)}}
+        )
+        await db.processing_jobs.update_one(
+            {"item_id": item_id},
+            {"$set": {"status": "unavailable", "error_message": str(e), "completed_at": datetime.now(timezone.utc)}}
+        )
+    except (asyncio.TimeoutError, Exception) as e:
         logger.error(f"Processing failed for {item_id}: {str(e)}")
         await db.items.update_one(
             {"_id": ObjectId(item_id)},
@@ -867,14 +880,34 @@ async def retry_processing(item_id: str, background_tasks: BackgroundTasks, user
     item = await db.items.find_one({"_id": ObjectId(item_id), "user_id": user["id"]})
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
-    if item.get("source_status") not in ["failed", "completed"]:
+
+    retry_count = item.get("retry_count", 0)
+    if retry_count >= MAX_RETRIES:
+        raise HTTPException(status_code=400, detail=f"Maximum retries ({MAX_RETRIES}) reached for this item.")
+
+    current_status = item.get("source_status")
+
+    # Allow retry for: failed, completed, unavailable.
+    # Also allow retrying a stuck "processing" item (>10 min old) as a safety valve.
+    stuck = False
+    if current_status == "processing":
+        updated_at = item.get("updated_at")
+        if updated_at and (datetime.now(timezone.utc) - updated_at).total_seconds() > 600:
+            stuck = True
+        else:
+            raise HTTPException(status_code=400, detail="Item is already being processed")
+
+    if current_status not in ["failed", "completed", "unavailable"] and not stuck:
         raise HTTPException(status_code=400, detail="Item is already being processed")
 
-    await db.items.update_one({"_id": ObjectId(item_id)}, {"$set": {"source_status": "processing"}})
+    await db.items.update_one(
+        {"_id": ObjectId(item_id)},
+        {"$set": {"source_status": "processing"}, "$inc": {"retry_count": 1}}
+    )
     await db.processing_jobs.update_one(
         {"item_id": item_id},
         {"$set": {"status": "pending", "step_name": "metadata_extraction", "error_message": "", "started_at": datetime.now(timezone.utc), "completed_at": None}},
         upsert=True
     )
     background_tasks.add_task(process_item, item_id, item["url"], item["platform"], user["id"])
-    return {"message": "Processing restarted"}
+    return {"message": "Processing restarted", "retry_count": retry_count + 1, "retries_remaining": MAX_RETRIES - retry_count - 1}

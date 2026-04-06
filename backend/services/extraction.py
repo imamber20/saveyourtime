@@ -13,6 +13,21 @@ import shutil
 
 logger = logging.getLogger("content_memory.extraction")
 
+
+class ContentUnavailableError(Exception):
+    """Raised when the target content has been removed, made private, or is otherwise inaccessible."""
+    pass
+
+
+_UNAVAILABLE_PATTERNS = [
+    "video unavailable", "this video is unavailable", "this video has been removed",
+    "private video", "this video is private", "this content isn't available",
+    "content not available", "no longer available", "has been deleted",
+    "account has been disabled", "page not found", "sorry, this page isn't available",
+    "does not exist", "post unavailable", "sorry, this reel", "reel not found",
+    "video does not exist", "removed by", "not available in your country",
+]
+
 # Find yt-dlp: check user bin, then venv, then PATH
 def _find_ytdlp() -> str:
     candidates = [
@@ -104,6 +119,11 @@ async def _extract_ytdlp_metadata(url: str, metadata: Dict) -> Dict:
             [YTDLP_PATH, "--dump-json", "--no-download", "--no-playlist", url],
             capture_output=True, text=True, timeout=45
         )
+        # Check for unavailable content before anything else
+        combined_output = (result.stdout + result.stderr).lower()
+        if result.returncode != 0 and any(p in combined_output for p in _UNAVAILABLE_PATTERNS):
+            raise ContentUnavailableError(f"Content removed or inaccessible: {url}")
+
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
             metadata["title"] = data.get("title", "")

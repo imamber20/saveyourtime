@@ -114,6 +114,11 @@ export default function ItemDetailPage() {
 
   if (!item) return null;
 
+  const MAX_RETRIES = 3;
+  const retryCount = item.retry_count ?? 0;
+  const retriesExhausted = retryCount >= MAX_RETRIES;
+  const canRetry = ['failed', 'completed', 'unavailable'].includes(item.source_status) && !retriesExhausted;
+
   const StatusIcon = item.source_status === 'completed' ? CheckCircle :
                      item.source_status === 'failed' ? AlertCircle : Clock;
 
@@ -134,11 +139,18 @@ export default function ItemDetailPage() {
           <span className="text-sm font-medium">Back</span>
         </button>
         <div className="flex items-center gap-2">
-          {item.source_status === 'failed' && (
+          {canRetry && (
             <button onClick={handleRetry} data-testid="retry-button"
-              className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors" aria-label="Retry">
+              className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors"
+              aria-label={`Reload (${MAX_RETRIES - retryCount} retries left)`}
+              title={`Reload & reprocess (${MAX_RETRIES - retryCount} retries left)`}>
               <RefreshCw className="w-4 h-4 text-text-secondary" />
             </button>
+          )}
+          {retriesExhausted && (
+            <span className="px-2.5 py-1.5 rounded-full border border-border-default text-xs text-text-secondary" title="Maximum retries reached">
+              Max retries
+            </span>
           )}
           <button onClick={() => setEditing(!editing)} data-testid="edit-button"
             className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors" aria-label="Edit">
