@@ -193,8 +193,9 @@ async def lifespan(app: FastAPI):
         await db.users.update_one({"email": ADMIN_EMAIL}, {"$set": {"password_hash": hash_password(ADMIN_PASSWORD)}})
 
     # Write test credentials
-    os.makedirs("/app/memory", exist_ok=True)
-    with open("/app/memory/test_credentials.md", "w") as f:
+    _memory_dir = os.environ.get("MEMORY_DIR", os.path.join(os.path.dirname(__file__), "..", "memory"))
+    os.makedirs(_memory_dir, exist_ok=True)
+    with open(os.path.join(_memory_dir, "test_credentials.md"), "w") as f:
         f.write("# Test Credentials\n\n")
         f.write(f"## Admin\n- Email: {ADMIN_EMAIL}\n- Password: {ADMIN_PASSWORD}\n- Role: admin\n\n")
         f.write("## Auth Endpoints\n")
