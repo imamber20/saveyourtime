@@ -1,0 +1,103 @@
+{
+  "timestamp": "2026-04-06T09:23:15.014431",
+  "total_tests": 19,
+  "passed_tests": 19,
+  "success_rate": 1.0,
+  "results": [
+    {
+      "test": "Health Check",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Admin Login",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Get Current User",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Save YouTube Shorts URL",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Save Invalid URL",
+      "success": true,
+      "details": "Status: 400"
+    },
+    {
+      "test": "Save Unsupported Platform",
+      "success": true,
+      "details": "Status: 400"
+    },
+    {
+      "test": "Save URL First Time",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Duplicate URL Detection",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "List Items",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Get Item Detail",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Update Item",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Create Collection",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "List Collections",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Add Item to Collection",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Search Items",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Get Map Items",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Get Categories",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Delete Item",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Logout",
+      "success": true,
+      "details": "Status: 200"
+    }
+  ]
+}

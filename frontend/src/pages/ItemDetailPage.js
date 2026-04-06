@@ -1,0 +1,372 @@
+import React, { useState, useEffect } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { motion } from 'framer-motion';
+import { itemsAPI, collectionsAPI, formatApiErrorDetail } from '../services/api';
+import {
+  ArrowLeft, ExternalLink, Edit3, Trash2, RefreshCw, MapPin, Tag,
+  Clock, CheckCircle, AlertCircle, FolderPlus, Loader2
+} from 'lucide-react';
+
+const VIDEO_PLACEHOLDER = 'https://static.prod-images.emergentagent.com/jobs/7ecda9fa-840f-42b6-a697-5367aaabdf99/images/54cc39fbc674b1e47eb9c19e535e10a091317d4c51804e073bbaf99dac7b9666.png';
+
+const PLATFORM_LABELS = { instagram: 'Instagram', youtube: 'YouTube', facebook: 'Facebook' };
+
+export default function ItemDetailPage() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const [item, setItem] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(false);
+  const [editForm, setEditForm] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [collections, setCollections] = useState([]);
+  const [showCollPicker, setShowCollPicker] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    fetchItem();
+    fetchCollections();
+  }, [id]);
+
+  const fetchItem = async () => {
+    try {
+      const { data } = await itemsAPI.get(id);
+      setItem(data);
+      setEditForm({
+        title: data.title || '',
+        summary: data.summary || '',
+        category: data.category || '',
+        sub_category: data.sub_category || '',
+        tags: (data.tags || []).join(', '),
+        notes: data.notes || '',
+      });
+    } catch (err) {
+      setError('Item not found');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchCollections = async () => {
+    try {
+      const { data } = await collectionsAPI.list();
+      setCollections(data.collections || []);
+    } catch {}
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const payload = {
+        title: editForm.title,
+        summary: editForm.summary,
+        category: editForm.category,
+        sub_category: editForm.sub_category,
+        tags: editForm.tags.split(',').map(t => t.trim()).filter(Boolean),
+        notes: editForm.notes,
+      };
+      const { data } = await itemsAPI.update(id, payload);
+      setItem(prev => ({ ...prev, ...data }));
+      setEditing(false);
+    } catch (err) {
+      setError(formatApiErrorDetail(err.response?.data?.detail));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!window.confirm('Delete this item?')) return;
+    try {
+      await itemsAPI.delete(id);
+      navigate('/');
+    } catch {}
+  };
+
+  const handleRetry = async () => {
+    try {
+      await itemsAPI.retry(id);
+      fetchItem();
+    } catch {}
+  };
+
+  const handleAddToCollection = async (collId) => {
+    try {
+      await collectionsAPI.addItem(collId, id);
+      setShowCollPicker(false);
+      fetchItem();
+    } catch {}
+  };
+
+  if (loading) return (
+    <div className="flex items-center justify-center py-20">
+      <Loader2 className="w-8 h-8 text-brand animate-spin" />
+    </div>
+  );
+
+  if (error && !item) return (
+    <div className="text-center py-20">
+      <p className="text-text-secondary">{error}</p>
+      <button onClick={() => navigate('/')} className="mt-4 text-brand hover:underline">Go home</button>
+    </div>
+  );
+
+  if (!item) return null;
+
+  const StatusIcon = item.source_status === 'completed' ? CheckCircle :
+                     item.source_status === 'failed' ? AlertCircle : Clock;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      data-testid="item-detail-page"
+    >
+      {/* Header */}
+      <div className="flex items-center justify-between mb-6">
+        <button
+          onClick={() => navigate(-1)}
+          data-testid="back-button"
+          className="flex items-center gap-2 text-text-secondary hover:text-text-primary transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          <span className="text-sm font-medium">Back</span>
+        </button>
+        <div className="flex items-center gap-2">
+          {item.source_status === 'failed' && (
+            <button onClick={handleRetry} data-testid="retry-button"
+              className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors" aria-label="Retry">
+              <RefreshCw className="w-4 h-4 text-text-secondary" />
+            </button>
+          )}
+          <button onClick={() => setEditing(!editing)} data-testid="edit-button"
+            className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors" aria-label="Edit">
+            <Edit3 className="w-4 h-4 text-text-secondary" />
+          </button>
+          <button onClick={() => setShowCollPicker(!showCollPicker)} data-testid="add-to-collection-button"
+            className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors" aria-label="Add to collection">
+            <FolderPlus className="w-4 h-4 text-text-secondary" />
+          </button>
+          <button onClick={handleDelete} data-testid="delete-button"
+            className="p-2.5 rounded-full border border-red-200 hover:bg-red-50 transition-colors" aria-label="Delete">
+            <Trash2 className="w-4 h-4 text-red-500" />
+          </button>
+        </div>
+      </div>
+
+      {/* Collection picker dropdown */}
+      {showCollPicker && (
+        <div className="mb-4 bg-white border border-border-default rounded-xl p-4 shadow-sm" data-testid="collection-picker">
+          <p className="text-sm font-medium text-text-primary mb-2">Add to collection</p>
+          {collections.length === 0 ? (
+            <p className="text-xs text-text-secondary">No collections yet. Create one first.</p>
+          ) : (
+            <div className="space-y-1">
+              {collections.map(c => (
+                <button key={c.id} onClick={() => handleAddToCollection(c.id)}
+                  className="block w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-surface-hover transition-colors">
+                  {c.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Content */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12">
+        {/* Left - Thumbnail */}
+        <div className="lg:col-span-5">
+          <div className="relative aspect-[9/16] rounded-2xl overflow-hidden bg-surface-hover">
+            <img
+              src={item.thumbnail_url || VIDEO_PLACEHOLDER}
+              alt={item.title}
+              className="w-full h-full object-cover"
+              onError={(e) => { e.target.src = VIDEO_PLACEHOLDER; }}
+            />
+            <div className="absolute inset-0 bg-gradient-to-t from-black/40 to-transparent" />
+          </div>
+          <a
+            href={item.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-testid="source-link"
+            className="flex items-center justify-center gap-2 mt-4 px-6 py-3 bg-white border border-border-default rounded-full text-sm font-medium text-text-primary hover:border-brand hover:text-brand transition-all"
+          >
+            <ExternalLink className="w-4 h-4" />
+            Open on {PLATFORM_LABELS[item.platform] || item.platform}
+          </a>
+        </div>
+
+        {/* Right - Details */}
+        <div className="lg:col-span-7 space-y-6">
+          {editing ? (
+            /* Edit Mode */
+            <div className="space-y-4" data-testid="edit-form">
+              <div>
+                <label className="block text-xs uppercase tracking-wider font-semibold text-text-secondary mb-1.5">Title</label>
+                <input
+                  value={editForm.title}
+                  onChange={(e) => setEditForm(f => ({ ...f, title: e.target.value }))}
+                  data-testid="edit-title-input"
+                  className="w-full px-4 py-2.5 border border-border-default rounded-xl text-sm focus:border-brand outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs uppercase tracking-wider font-semibold text-text-secondary mb-1.5">Summary</label>
+                <textarea
+                  value={editForm.summary}
+                  onChange={(e) => setEditForm(f => ({ ...f, summary: e.target.value }))}
+                  data-testid="edit-summary-input"
+                  rows={3}
+                  className="w-full px-4 py-2.5 border border-border-default rounded-xl text-sm focus:border-brand outline-none resize-none"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs uppercase tracking-wider font-semibold text-text-secondary mb-1.5">Category</label>
+                  <input
+                    value={editForm.category}
+                    onChange={(e) => setEditForm(f => ({ ...f, category: e.target.value }))}
+                    data-testid="edit-category-input"
+                    className="w-full px-4 py-2.5 border border-border-default rounded-xl text-sm focus:border-brand outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs uppercase tracking-wider font-semibold text-text-secondary mb-1.5">Sub-Category</label>
+                  <input
+                    value={editForm.sub_category}
+                    onChange={(e) => setEditForm(f => ({ ...f, sub_category: e.target.value }))}
+                    data-testid="edit-subcategory-input"
+                    className="w-full px-4 py-2.5 border border-border-default rounded-xl text-sm focus:border-brand outline-none"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs uppercase tracking-wider font-semibold text-text-secondary mb-1.5">Tags (comma separated)</label>
+                <input
+                  value={editForm.tags}
+                  onChange={(e) => setEditForm(f => ({ ...f, tags: e.target.value }))}
+                  data-testid="edit-tags-input"
+                  className="w-full px-4 py-2.5 border border-border-default rounded-xl text-sm focus:border-brand outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs uppercase tracking-wider font-semibold text-text-secondary mb-1.5">Notes</label>
+                <textarea
+                  value={editForm.notes}
+                  onChange={(e) => setEditForm(f => ({ ...f, notes: e.target.value }))}
+                  data-testid="edit-notes-input"
+                  rows={3}
+                  className="w-full px-4 py-2.5 border border-border-default rounded-xl text-sm focus:border-brand outline-none resize-none"
+                />
+              </div>
+              <div className="flex gap-3">
+                <button onClick={handleSave} disabled={saving} data-testid="save-edit-button"
+                  className="bg-brand text-page rounded-full px-6 py-2.5 text-sm font-medium hover:bg-brand-hover transition-colors disabled:opacity-50">
+                  {saving ? 'Saving...' : 'Save Changes'}
+                </button>
+                <button onClick={() => setEditing(false)} data-testid="cancel-edit-button"
+                  className="bg-white border border-border-default text-text-primary rounded-full px-6 py-2.5 text-sm font-medium hover:bg-surface-hover transition-colors">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            /* View Mode */
+            <>
+              {/* Status */}
+              <div className="flex items-center gap-2">
+                <StatusIcon className={`w-4 h-4 ${
+                  item.source_status === 'completed' ? 'text-green-500' :
+                  item.source_status === 'failed' ? 'text-red-500' : 'text-yellow-500'
+                }`} />
+                <span className="text-xs uppercase tracking-wider font-semibold text-text-secondary">
+                  {item.source_status}
+                </span>
+                <span className="text-xs text-text-secondary">
+                  {PLATFORM_LABELS[item.platform]}
+                </span>
+                {item.confidence_score > 0 && (
+                  <span className="text-xs text-text-secondary ml-auto">
+                    {Math.round(item.confidence_score * 100)}% confidence
+                  </span>
+                )}
+              </div>
+
+              {/* Title */}
+              <h1 className="font-heading text-2xl sm:text-3xl font-semibold text-text-primary leading-tight" data-testid="item-title">
+                {item.title || 'Untitled'}
+              </h1>
+
+              {/* Category & Tags */}
+              <div className="flex flex-wrap items-center gap-2">
+                {item.category && (
+                  <span className="inline-flex items-center px-3 py-1.5 rounded-full text-xs uppercase tracking-wider font-semibold bg-brand/10 text-brand">
+                    {item.category}
+                  </span>
+                )}
+                {item.sub_category && (
+                  <span className="inline-flex items-center px-3 py-1.5 rounded-full text-xs uppercase tracking-wider font-medium bg-sage/10 text-sage">
+                    {item.sub_category}
+                  </span>
+                )}
+                {(item.tags || []).map(tag => (
+                  <span key={tag} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] uppercase tracking-wider font-medium bg-surface-hover text-text-secondary border border-border-default">
+                    <Tag className="w-3 h-3" />{tag}
+                  </span>
+                ))}
+              </div>
+
+              {/* Summary */}
+              {item.summary && (
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2">Summary</h3>
+                  <p className="text-text-primary leading-relaxed" data-testid="item-summary">{item.summary}</p>
+                </div>
+              )}
+
+              {/* Notes */}
+              {item.notes && (
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2">Notes</h3>
+                  <p className="text-text-primary leading-relaxed">{item.notes}</p>
+                </div>
+              )}
+
+              {/* Places */}
+              {item.places && item.places.length > 0 && (
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2">Places</h3>
+                  <div className="space-y-2">
+                    {item.places.map(place => (
+                      <div key={place.id} className="flex items-center gap-2 text-sm">
+                        <MapPin className="w-4 h-4 text-brand" />
+                        <span>{place.name}</span>
+                        {place.address && <span className="text-text-secondary text-xs truncate">- {place.address}</span>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Collections */}
+              {item.collections && item.collections.length > 0 && (
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2">Collections</h3>
+                  <div className="flex flex-wrap gap-2">
+                    {item.collections.map(c => (
+                      <span key={c.id} className="inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium bg-surface-hover text-text-secondary border border-border-default">
+                        {c.name}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
