@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { itemsAPI, categoriesAPI, formatApiErrorDetail } from '../services/api';
 import SaveUrlInput from '../components/SaveUrlInput';
-import ItemCard, { CheckingTile, ContentGoneTile } from '../components/ItemCard';
+import ItemCard, { CheckingTile, ContentGoneTile, DuplicateTile } from '../components/ItemCard';
 import EmptyState from '../components/EmptyState';
 import { Filter, Loader2 } from 'lucide-react';
 
@@ -54,28 +54,40 @@ export default function HomePage() {
   const handleSave = async (url) => {
     const tileId = Date.now();
     const platform = detectPlatformClient(url);
+    const trimmedUrl = url.trim();
+
+    // ── Client-side duplicate check (instant, no API call needed) ──────────
+    const existingItem = items.find(item => item.url === trimmedUrl);
+    if (existingItem) {
+      setPendingTiles(t => [...t, { id: tileId, platform, status: 'duplicate', existingItem }]);
+      return; // tile auto-expires via DuplicateTile's onExpire
+    }
+
     // 1. Immediately show the checking skeleton tile
     setPendingTiles(t => [...t, { id: tileId, platform, status: 'checking' }]);
     setSaving(true);
     setSaveMsg(null);
     try {
-      const { data } = await itemsAPI.save(url);
-      // 2a. Success — remove checking tile, let fetchItems show the real card
-      setPendingTiles(t => t.filter(x => x.id !== tileId));
+      const { data } = await itemsAPI.save(trimmedUrl);
+      // 2a. Server confirmed duplicate (edge case: item saved in another tab)
       if (data.status === 'duplicate') {
-        setSaveMsg({ type: 'info', text: 'This URL was already saved.' });
-        setTimeout(() => setSaveMsg(null), 3000);
+        const serverExisting = items.find(i => i.id === data.item_id) || null;
+        setPendingTiles(t => t.map(x => x.id === tileId
+          ? { ...x, status: 'duplicate', existingItem: serverExisting }
+          : x));
       } else {
+        // 2b. Success — remove checking tile, let fetchItems show the real card
+        setPendingTiles(t => t.filter(x => x.id !== tileId));
         setTimeout(fetchItems, 300);
       }
     } catch (err) {
       const detail = err.response?.data?.detail;
       const isUnavailable = detail && typeof detail === 'object' && detail.type === 'unavailable';
       if (isUnavailable) {
-        // 2b. Content gone — morph tile to 404 animation
+        // 2c. Content gone — morph tile to 404 animation
         setPendingTiles(t => t.map(x => x.id === tileId ? { ...x, status: 'gone' } : x));
       } else {
-        // 2c. Other error — remove tile, show brief message
+        // 2d. Other error — remove tile, show brief message
         setPendingTiles(t => t.filter(x => x.id !== tileId));
         setSaveMsg({ type: 'error', text: formatApiErrorDetail(detail) || 'Failed to save. Please try again.' });
         setTimeout(() => setSaveMsg(null), 4000);
@@ -177,6 +189,10 @@ export default function HomePage() {
               {pendingTiles.map((tile, i) =>
                 tile.status === 'checking' ? (
                   <CheckingTile key={tile.id} platform={tile.platform} index={i} />
+                ) : tile.status === 'duplicate' ? (
+                  <DuplicateTile key={tile.id} platform={tile.platform} index={i}
+                    existingItem={tile.existingItem}
+                    onExpire={() => removePendingTile(tile.id)} />
                 ) : (
                   <ContentGoneTile key={tile.id} platform={tile.platform} index={i}
                     onExpire={() => removePendingTile(tile.id)} />

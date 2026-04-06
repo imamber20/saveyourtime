@@ -72,6 +72,64 @@ export function ProcessingCard({ item, index = 0 }) {
   );
 }
 
+// ── Duplicate tile — shown when URL is already in the library ─────────────────
+export function DuplicateTile({ existingItem, platform, onExpire, index = 0 }) {
+  useEffect(() => {
+    const t = setTimeout(() => onExpire?.(), 5000);
+    return () => clearTimeout(t);
+  }, [onExpire]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, scale: 0.95 }}
+      transition={{ duration: 0.3, delay: index * 0.05 }}
+      className="bg-white border-2 border-brand/40 rounded-2xl shadow-sm overflow-hidden relative"
+    >
+      {/* Thumbnail with overlay */}
+      <div className="relative aspect-[9/16] bg-surface-hover overflow-hidden">
+        {existingItem?.thumbnail_url ? (
+          <img src={existingItem.thumbnail_url} alt={existingItem.title}
+            className="w-full h-full object-cover opacity-60" />
+        ) : (
+          <div className="w-full h-full bg-gradient-to-br from-brand/20 to-brand/5" />
+        )}
+        <div className="absolute inset-0 bg-brand/10" />
+
+        {/* Platform badge */}
+        {platform && (
+          <div className="absolute top-3 left-3">
+            <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-[10px] uppercase tracking-wider font-semibold text-white ${PLATFORM_COLORS[platform] || 'bg-text-secondary'}`}>
+              {PLATFORM_LABELS[platform] || platform}
+            </span>
+          </div>
+        )}
+
+        {/* Already saved badge */}
+        <div className="absolute top-3 right-3">
+          <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-brand text-white text-[10px] font-bold uppercase tracking-wider">
+            <CheckCircle className="w-3 h-3" /> Saved
+          </span>
+        </div>
+
+        {/* Bottom info */}
+        <div className="absolute bottom-0 left-0 right-0 p-3 bg-gradient-to-t from-black/70 to-transparent">
+          <p className="text-white text-xs font-semibold line-clamp-2 leading-snug">
+            {existingItem?.title || 'Already in your library'}
+          </p>
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div className="px-3 py-2.5 flex items-center gap-2">
+        <CheckCircle className="w-3.5 h-3.5 text-brand flex-shrink-0" />
+        <span className="text-xs text-brand font-semibold">Already in your library</span>
+      </div>
+    </motion.div>
+  );
+}
+
 // ── Checking tile — shown while pre-save availability check runs ─────────────
 export function CheckingTile({ platform, index = 0 }) {
   return (
