@@ -6,10 +6,14 @@ from typing import Optional, Dict
 import subprocess
 import json
 import os
+import sys
 import tempfile
 import shutil
 
 logger = logging.getLogger("content_memory.extraction")
+
+# Find yt-dlp in the venv
+YTDLP_PATH = os.path.join(os.path.dirname(sys.executable), "yt-dlp")
 
 # ─── URL Validation ───────────────────────────────────────────────────────────
 URL_REGEX = re.compile(
@@ -82,7 +86,7 @@ async def extract_youtube_metadata(url: str, metadata: Dict) -> Dict:
     """Extract metadata from YouTube using yt-dlp (no download)."""
     try:
         result = subprocess.run(
-            ["yt-dlp", "--dump-json", "--no-download", "--no-playlist", url],
+            [YTDLP_PATH, "--dump-json", "--no-download", "--no-playlist", url],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
@@ -153,26 +157,25 @@ async def extract_opengraph_metadata(url: str, metadata: Dict) -> Dict:
 
 # ─── Temporary Media Processing ──────────────────────────────────────────────
 async def extract_transcript_from_video(url: str, platform: str) -> Optional[str]:
-    """Temporarily download and extract transcript. Cleans up after."""
+    """Temporarily download and extract transcript using OpenAI Whisper. Cleans up after."""
     temp_dir = tempfile.mkdtemp(prefix="content_memory_")
     try:
         audio_path = os.path.join(temp_dir, "audio.mp3")
 
         # Download audio only using yt-dlp
         result = subprocess.run(
-            ["yt-dlp", "-x", "--audio-format", "mp3", "-o", audio_path, "--no-playlist", url],
+            [YTDLP_PATH, "-x", "--audio-format", "mp3", "-o", audio_path, "--no-playlist", url],
             capture_output=True, text=True, timeout=60
         )
         if result.returncode != 0:
             logger.warning(f"Audio extraction failed: {result.stderr}")
             return None
 
-        # Check if audio file exists
+        # Check if audio file exists (yt-dlp sometimes adds extensions)
         actual_path = audio_path
         if not os.path.exists(actual_path):
-            # yt-dlp sometimes adds extensions
             for f in os.listdir(temp_dir):
-                if f.endswith(".mp3"):
+                if f.endswith(".mp3") or f.endswith(".m4a") or f.endswith(".opus"):
                     actual_path = os.path.join(temp_dir, f)
                     break
 
@@ -180,7 +183,13 @@ async def extract_transcript_from_video(url: str, platform: str) -> Optional[str
             return None
 
         logger.info(f"Audio extracted to {actual_path}, size: {os.path.getsize(actual_path)}")
-        return None  # Transcript via external API would go here
+
+        # Transcribe using OpenAI Whisper
+        from services.ai_service import transcribe_audio
+        transcript = await transcribe_audio(actual_path)
+        if transcript:
+            logger.info(f"Transcript extracted ({len(transcript)} chars)")
+        return transcript
 
     except Exception as e:
         logger.error(f"Transcript extraction failed: {e}")

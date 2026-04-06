@@ -385,6 +385,21 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
         }
         await db.items.update_one({"_id": ObjectId(item_id)}, {"$set": update_fields})
 
+        # Step 1.5: Attempt transcript extraction for YouTube (enriches AI input)
+        if platform == "youtube":
+            try:
+                from services.extraction import extract_transcript_from_video
+                await db.processing_jobs.update_one(
+                    {"item_id": item_id},
+                    {"$set": {"step_name": "transcript_extraction"}}
+                )
+                transcript = await extract_transcript_from_video(url, platform)
+                if transcript:
+                    metadata["transcript"] = transcript
+                    logger.info(f"Transcript added for {item_id}")
+            except Exception as e:
+                logger.warning(f"Transcript extraction skipped for {item_id}: {e}")
+
         # Step 2: AI categorization
         await db.processing_jobs.update_one(
             {"item_id": item_id},
