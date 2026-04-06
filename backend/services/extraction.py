@@ -2,7 +2,7 @@ import re
 import logging
 import httpx
 from bs4 import BeautifulSoup
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import subprocess
 import json
 import os
@@ -12,8 +12,19 @@ import shutil
 
 logger = logging.getLogger("content_memory.extraction")
 
-# Find yt-dlp in the venv
-YTDLP_PATH = os.path.join(os.path.dirname(sys.executable), "yt-dlp")
+# Find yt-dlp: check user bin, then venv, then PATH
+def _find_ytdlp() -> str:
+    candidates = [
+        os.path.join(os.path.expanduser("~"), "Library", "Python", "3.9", "bin", "yt-dlp"),
+        os.path.join(os.path.dirname(sys.executable), "yt-dlp"),
+        shutil.which("yt-dlp") or "",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return "yt-dlp"  # fallback to PATH
+
+YTDLP_PATH = _find_ytdlp()
 
 # ─── URL Validation ───────────────────────────────────────────────────────────
 URL_REGEX = re.compile(
@@ -61,6 +72,7 @@ async def extract_metadata(url: str, platform: str) -> Dict:
         "title": "",
         "description": "",
         "thumbnail_url": "",
+        "thumbnail_urls": [],   # multiple frames for vision
         "author": "",
         "platform": platform,
         "url": url,
@@ -68,50 +80,69 @@ async def extract_metadata(url: str, platform: str) -> Dict:
         "duration": "",
     }
 
+    # Try yt-dlp first for ALL platforms — it supports YouTube, Instagram, Facebook
     try:
-        if platform == "youtube":
-            metadata = await extract_youtube_metadata(url, metadata)
-        else:
-            metadata = await extract_opengraph_metadata(url, metadata)
+        metadata = await _extract_ytdlp_metadata(url, metadata)
     except Exception as e:
-        logger.warning(f"Primary extraction failed for {url}: {e}")
+        logger.warning(f"yt-dlp extraction failed for {url}: {e}")
+
+    # Fall back to OpenGraph if yt-dlp got nothing useful
+    if not metadata.get("title") and not metadata.get("description"):
         try:
             metadata = await extract_opengraph_metadata(url, metadata)
-        except Exception as e2:
-            logger.warning(f"Fallback extraction also failed for {url}: {e2}")
+        except Exception as e:
+            logger.warning(f"OpenGraph fallback also failed for {url}: {e}")
 
     return metadata
 
-async def extract_youtube_metadata(url: str, metadata: Dict) -> Dict:
-    """Extract metadata from YouTube using yt-dlp (no download)."""
+
+async def _extract_ytdlp_metadata(url: str, metadata: Dict) -> Dict:
+    """Use yt-dlp to extract metadata for YouTube, Instagram, and Facebook."""
     try:
         result = subprocess.run(
             [YTDLP_PATH, "--dump-json", "--no-download", "--no-playlist", url],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=45
         )
-        if result.returncode == 0:
+        if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
             metadata["title"] = data.get("title", "")
-            metadata["description"] = data.get("description", "")
-            metadata["thumbnail_url"] = data.get("thumbnail", "")
-            metadata["author"] = data.get("uploader", "") or data.get("channel", "")
+            metadata["description"] = data.get("description", "") or ""
+            metadata["author"] = data.get("uploader", "") or data.get("channel", "") or data.get("creator", "")
             metadata["duration"] = str(data.get("duration", ""))
 
-            # Try to get auto-captions/subtitles for transcript
-            subtitles = data.get("subtitles", {})
-            auto_captions = data.get("automatic_captions", {})
-            if subtitles or auto_captions:
-                metadata["has_captions"] = True
+            # Collect multiple thumbnail URLs at different timestamps for vision analysis
+            thumb_url = data.get("thumbnail", "")
+            thumb_list = []
+
+            thumbnails = data.get("thumbnails", [])
+            if thumbnails:
+                # Pick up to 4 thumbnails spread across the list for coverage
+                step = max(1, len(thumbnails) // 4)
+                for i in range(0, min(len(thumbnails), 4 * step), step):
+                    t = thumbnails[i]
+                    if isinstance(t, dict) and t.get("url"):
+                        thumb_list.append(t["url"])
+
+            # Make sure the main thumbnail is included
+            if thumb_url and thumb_url not in thumb_list:
+                thumb_list.insert(0, thumb_url)
+
+            metadata["thumbnail_url"] = thumb_url or (thumb_list[0] if thumb_list else "")
+            metadata["thumbnail_urls"] = thumb_list[:4]  # max 4 frames
+
+            logger.info(f"yt-dlp extracted '{metadata['title']}' with {len(thumb_list)} thumbnails")
+        else:
+            logger.warning(f"yt-dlp returned non-zero exit ({result.returncode}) for {url}: {result.stderr[:200]}")
     except subprocess.TimeoutExpired:
         logger.warning(f"yt-dlp timed out for {url}")
     except Exception as e:
         logger.warning(f"yt-dlp failed for {url}: {e}")
-        metadata = await extract_opengraph_metadata(url, metadata)
 
     return metadata
 
+
 async def extract_opengraph_metadata(url: str, metadata: Dict) -> Dict:
-    """Extract OpenGraph metadata from any URL."""
+    """Extract OpenGraph metadata as fallback."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -121,80 +152,84 @@ async def extract_opengraph_metadata(url: str, metadata: Dict) -> Dict:
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "lxml")
 
-                # OpenGraph tags
                 og_title = soup.find("meta", property="og:title")
                 og_desc = soup.find("meta", property="og:description")
                 og_image = soup.find("meta", property="og:image")
-
-                # Twitter card fallback
                 tw_title = soup.find("meta", attrs={"name": "twitter:title"})
                 tw_desc = soup.find("meta", attrs={"name": "twitter:description"})
                 tw_image = soup.find("meta", attrs={"name": "twitter:image"})
-
-                # Standard fallback
                 title_tag = soup.find("title")
 
-                metadata["title"] = (
+                title = (
                     (og_title and og_title.get("content", "")) or
                     (tw_title and tw_title.get("content", "")) or
-                    (title_tag and title_tag.get_text(strip=True)) or
-                    ""
+                    (title_tag and title_tag.get_text(strip=True)) or ""
                 )
-                metadata["description"] = (
+                description = (
                     (og_desc and og_desc.get("content", "")) or
-                    (tw_desc and tw_desc.get("content", "")) or
-                    ""
+                    (tw_desc and tw_desc.get("content", "")) or ""
                 )
-                metadata["thumbnail_url"] = (
+                image = (
                     (og_image and og_image.get("content", "")) or
-                    (tw_image and tw_image.get("content", "")) or
-                    ""
+                    (tw_image and tw_image.get("content", "")) or ""
                 )
+
+                if title and not metadata.get("title"):
+                    metadata["title"] = title
+                if description and not metadata.get("description"):
+                    metadata["description"] = description
+                if image and not metadata.get("thumbnail_url"):
+                    metadata["thumbnail_url"] = image
+                    if image not in metadata.get("thumbnail_urls", []):
+                        metadata.setdefault("thumbnail_urls", []).insert(0, image)
     except Exception as e:
         logger.warning(f"OpenGraph extraction failed for {url}: {e}")
 
     return metadata
 
-# ─── Temporary Media Processing ──────────────────────────────────────────────
+
+# ─── Audio Transcript Extraction ─────────────────────────────────────────────
 async def extract_transcript_from_video(url: str, platform: str) -> Optional[str]:
-    """Temporarily download and extract transcript using OpenAI Whisper. Cleans up after."""
+    """Download audio and transcribe using OpenAI Whisper. Works for all platforms."""
     temp_dir = tempfile.mkdtemp(prefix="content_memory_")
     try:
         audio_path = os.path.join(temp_dir, "audio.mp3")
 
-        # Download audio only using yt-dlp
         result = subprocess.run(
-            [YTDLP_PATH, "-x", "--audio-format", "mp3", "-o", audio_path, "--no-playlist", url],
-            capture_output=True, text=True, timeout=60
+            [YTDLP_PATH, "-x", "--audio-format", "mp3",
+             "--audio-quality", "5",          # smaller file = faster
+             "--max-filesize", "50m",          # cap at 50MB
+             "-o", audio_path,
+             "--no-playlist", url],
+            capture_output=True, text=True, timeout=90
         )
         if result.returncode != 0:
-            logger.warning(f"Audio extraction failed: {result.stderr}")
+            logger.warning(f"Audio extraction failed ({platform}): {result.stderr[:300]}")
             return None
 
-        # Check if audio file exists (yt-dlp sometimes adds extensions)
+        # yt-dlp sometimes appends extension
         actual_path = audio_path
         if not os.path.exists(actual_path):
             for f in os.listdir(temp_dir):
-                if f.endswith(".mp3") or f.endswith(".m4a") or f.endswith(".opus"):
+                if f.endswith((".mp3", ".m4a", ".opus", ".webm", ".aac")):
                     actual_path = os.path.join(temp_dir, f)
                     break
 
         if not os.path.exists(actual_path):
+            logger.warning("Audio file not found after extraction")
             return None
 
-        logger.info(f"Audio extracted to {actual_path}, size: {os.path.getsize(actual_path)}")
+        size_mb = os.path.getsize(actual_path) / (1024 * 1024)
+        logger.info(f"Audio extracted: {actual_path} ({size_mb:.1f} MB)")
 
-        # Transcribe using OpenAI Whisper
         from services.ai_service import transcribe_audio
         transcript = await transcribe_audio(actual_path)
         if transcript:
-            logger.info(f"Transcript extracted ({len(transcript)} chars)")
+            logger.info(f"Transcript extracted: {len(transcript)} chars")
         return transcript
 
     except Exception as e:
-        logger.error(f"Transcript extraction failed: {e}")
+        logger.error(f"Transcript extraction failed for {platform}: {e}")
         return None
     finally:
-        # Always cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.info(f"Cleaned up temp dir: {temp_dir}")

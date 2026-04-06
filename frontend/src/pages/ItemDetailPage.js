@@ -4,7 +4,8 @@ import { motion } from 'framer-motion';
 import { itemsAPI, collectionsAPI, formatApiErrorDetail } from '../services/api';
 import {
   ArrowLeft, ExternalLink, Edit3, Trash2, RefreshCw, MapPin, Tag,
-  Clock, CheckCircle, AlertCircle, FolderPlus, Loader2
+  Clock, CheckCircle, AlertCircle, FolderPlus, Loader2,
+  List, ChefHat, Footprints, FileText
 } from 'lucide-react';
 
 const VIDEO_PLACEHOLDER = 'https://static.prod-images.emergentagent.com/jobs/7ecda9fa-840f-42b6-a697-5367aaabdf99/images/54cc39fbc674b1e47eb9c19e535e10a091317d4c51804e073bbaf99dac7b9666.png';
@@ -323,6 +324,71 @@ export default function ItemDetailPage() {
                 <div>
                   <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2">Summary</h3>
                   <p className="text-text-primary leading-relaxed" data-testid="item-summary">{item.summary}</p>
+                </div>
+              )}
+
+              {/* Key Points */}
+              {item.key_points && item.key_points.length > 0 && (
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2 flex items-center gap-1.5">
+                    <List className="w-3.5 h-3.5" /> Key Points
+                  </h3>
+                  <ul className="space-y-1.5">
+                    {item.key_points.map((pt, i) => (
+                      <li key={i} className="flex items-start gap-2 text-sm text-text-primary leading-relaxed">
+                        <span className="mt-1.5 flex-shrink-0 w-1.5 h-1.5 rounded-full bg-brand" />
+                        {pt}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Ingredients */}
+              {item.ingredients && item.ingredients.length > 0 && (
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2 flex items-center gap-1.5">
+                    <ChefHat className="w-3.5 h-3.5" /> Ingredients
+                  </h3>
+                  <ul className="grid grid-cols-2 gap-x-4 gap-y-1">
+                    {item.ingredients.map((ing, i) => (
+                      <li key={i} className="flex items-center gap-1.5 text-sm text-text-primary">
+                        <span className="w-1 h-1 rounded-full bg-accent flex-shrink-0" />
+                        {ing}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Steps / Instructions */}
+              {item.steps && item.steps.length > 0 && (
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2 flex items-center gap-1.5">
+                    <Footprints className="w-3.5 h-3.5" /> Steps
+                  </h3>
+                  <ol className="space-y-2">
+                    {item.steps.map((step, i) => (
+                      <li key={i} className="flex items-start gap-3 text-sm text-text-primary leading-relaxed">
+                        <span className="flex-shrink-0 w-5 h-5 rounded-full bg-brand/10 text-brand text-[10px] font-bold flex items-center justify-center mt-0.5">
+                          {i + 1}
+                        </span>
+                        {step.replace(/^step\s*\d+[:\-\s]*/i, '')}
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+
+              {/* Transcript excerpt */}
+              {item.transcript_excerpt && (
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2 flex items-center gap-1.5">
+                    <FileText className="w-3.5 h-3.5" /> Audio Transcript (excerpt)
+                  </h3>
+                  <p className="text-sm text-text-secondary leading-relaxed italic border-l-2 border-border-default pl-3">
+                    "{item.transcript_excerpt}"
+                  </p>
                 </div>
               )}
 

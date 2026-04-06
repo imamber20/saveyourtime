@@ -50,9 +50,8 @@ export default function HomePage() {
       if (data.status === 'duplicate') {
         setSaveMsg({ type: 'info', text: 'This URL was already saved.' });
       } else {
-        setSaveMsg({ type: 'success', text: 'Saved! Processing content...' });
-        // Refresh after a short delay to show processing state
-        setTimeout(fetchItems, 500);
+        setSaveMsg({ type: 'success', text: '✓ Saved! Analysing content — this takes ~15 seconds.' });
+        setTimeout(fetchItems, 400);
       }
     } catch (err) {
       setSaveMsg({ type: 'error', text: formatApiErrorDetail(err.response?.data?.detail) || 'Failed to save' });
@@ -62,11 +61,11 @@ export default function HomePage() {
     }
   };
 
-  // Poll for processing items
+  // Poll every 2s while any item is still processing
   useEffect(() => {
     const hasProcessing = items.some(i => i.source_status === 'processing');
     if (!hasProcessing) return;
-    const interval = setInterval(fetchItems, 5000);
+    const interval = setInterval(fetchItems, 2000);
     return () => clearInterval(interval);
   }, [items, fetchItems]);
 

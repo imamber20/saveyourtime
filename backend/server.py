@@ -113,6 +113,9 @@ class UpdateItemRequest(BaseModel):
     sub_category: Optional[str] = None
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
+    key_points: Optional[List[str]] = None
+    steps: Optional[List[str]] = None
+    ingredients: Optional[List[str]] = None
 
 class CreateCollectionRequest(BaseModel):
     name: str
@@ -181,16 +184,20 @@ async def lifespan(app: FastAPI):
     # Seed admin
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if not existing:
-        await db.users.insert_one({
+        ins = await db.users.insert_one({
             "email": ADMIN_EMAIL,
             "password_hash": hash_password(ADMIN_PASSWORD),
             "name": "Admin",
             "role": "admin",
             "created_at": datetime.now(timezone.utc)
         })
+        await seed_default_collections(str(ins.inserted_id))
         logger.info(f"Admin user seeded: {ADMIN_EMAIL}")
-    elif not verify_password(ADMIN_PASSWORD, existing["password_hash"]):
-        await db.users.update_one({"email": ADMIN_EMAIL}, {"$set": {"password_hash": hash_password(ADMIN_PASSWORD)}})
+    else:
+        if not verify_password(ADMIN_PASSWORD, existing["password_hash"]):
+            await db.users.update_one({"email": ADMIN_EMAIL}, {"$set": {"password_hash": hash_password(ADMIN_PASSWORD)}})
+        # Seed collections for existing admin if missing
+        await seed_default_collections(str(existing["_id"]))
 
     # Write test credentials
     _memory_dir = os.environ.get("MEMORY_DIR", os.path.join(os.path.dirname(__file__), "..", "memory"))
@@ -223,8 +230,33 @@ async def health():
     return {"status": "ok", "service": "content-memory", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 # ─── Auth Routes ──────────────────────────────────────────────────────────────
+DEFAULT_COLLECTIONS = [
+    {"name": "Fitness & Health",   "description": "Workouts, wellness tips, and health routines"},
+    {"name": "Travel",             "description": "Places to visit, travel tips, and destination guides"},
+    {"name": "Food & Recipes",     "description": "Recipes, cooking techniques, and restaurant finds"},
+    {"name": "Technology",         "description": "Tech tutorials, gadget reviews, and digital tips"},
+    {"name": "Learning",           "description": "Educational content, how-tos, and skill-building"},
+    {"name": "Entertainment",      "description": "Fun videos, comedy, music, and pop culture"},
+    {"name": "Finance",            "description": "Money tips, investing advice, and personal finance"},
+    {"name": "Fashion & Style",    "description": "Outfits, beauty tips, skincare, and shopping picks"},
+]
+
+async def seed_default_collections(user_id: str):
+    """Create default collections for a new user if they don't already exist."""
+    now = datetime.now(timezone.utc)
+    for coll in DEFAULT_COLLECTIONS:
+        existing = await db.collections.find_one({"user_id": user_id, "name": coll["name"]})
+        if not existing:
+            await db.collections.insert_one({
+                "user_id": user_id,
+                "name": coll["name"],
+                "description": coll["description"],
+                "created_at": now,
+                "updated_at": now,
+            })
+
 @app.post("/api/auth/register")
-async def register(req: RegisterRequest, response: Response):
+async def register(req: RegisterRequest, response: Response, background_tasks: BackgroundTasks):
     email = req.email.lower().strip()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -240,6 +272,7 @@ async def register(req: RegisterRequest, response: Response):
     access_token = create_access_token(user_id, email)
     refresh_token = create_refresh_token(user_id)
     set_auth_cookies(response, access_token, refresh_token)
+    background_tasks.add_task(seed_default_collections, user_id)
     return {"id": user_id, "email": email, "name": req.name, "role": "user"}
 
 @app.post("/api/auth/login")
@@ -338,6 +371,11 @@ async def save_url(req: SaveRequest, background_tasks: BackgroundTasks, user: di
         "platform": platform,
         "title": "",
         "summary": "",
+        "key_points": [],
+        "steps": [],
+        "ingredients": [],
+        "transcript_excerpt": "",
+        "visual_text": "",
         "category": "",
         "sub_category": "",
         "tags": [],
@@ -368,52 +406,78 @@ async def save_url(req: SaveRequest, background_tasks: BackgroundTasks, user: di
 # ─── Background Processing Pipeline ──────────────────────────────────────────
 async def process_item(item_id: str, url: str, platform: str, user_id: str):
     try:
-        logger.info(f"Processing item {item_id}: {url}")
+        logger.info(f"Processing item {item_id} ({platform}): {url}")
 
-        # Step 1: Metadata extraction
+        # ── Step 1: Metadata extraction (yt-dlp for all platforms) ──────────
         await db.processing_jobs.update_one(
             {"item_id": item_id},
             {"$set": {"status": "running", "step_name": "metadata_extraction"}}
         )
         metadata = await extract_metadata(url, platform)
-        logger.info(f"Metadata extracted for {item_id}: {metadata.get('title', 'N/A')}")
+        logger.info(f"Metadata extracted for {item_id}: '{metadata.get('title', 'N/A')}'")
 
-        # Update item with raw metadata
-        update_fields = {
+        # Update item with early metadata so UI shows thumbnail quickly
+        await db.items.update_one({"_id": ObjectId(item_id)}, {"$set": {
             "title": metadata.get("title", ""),
             "thumbnail_url": metadata.get("thumbnail_url", ""),
             "updated_at": datetime.now(timezone.utc)
-        }
-        await db.items.update_one({"_id": ObjectId(item_id)}, {"$set": update_fields})
+        }})
 
-        # Step 1.5: Attempt transcript extraction for YouTube (enriches AI input)
-        if platform == "youtube":
+        # ── Step 2: Vision analysis — send thumbnail frames to GPT-4o ───────
+        visual_text = ""
+        thumb_urls = metadata.get("thumbnail_urls", [])
+        if not thumb_urls and metadata.get("thumbnail_url"):
+            thumb_urls = [metadata["thumbnail_url"]]
+
+        if thumb_urls:
             try:
-                from services.extraction import extract_transcript_from_video
                 await db.processing_jobs.update_one(
                     {"item_id": item_id},
-                    {"$set": {"step_name": "transcript_extraction"}}
+                    {"$set": {"step_name": "vision_analysis"}}
                 )
-                transcript = await extract_transcript_from_video(url, platform)
-                if transcript:
-                    metadata["transcript"] = transcript
-                    logger.info(f"Transcript added for {item_id}")
+                from services.ai_service import analyze_thumbnails_with_vision
+                visual_text = await analyze_thumbnails_with_vision(thumb_urls)
+                if visual_text:
+                    metadata["visual_text"] = visual_text
+                    logger.info(f"Vision analysis done for {item_id}: {len(visual_text)} chars")
             except Exception as e:
-                logger.warning(f"Transcript extraction skipped for {item_id}: {e}")
+                logger.warning(f"Vision analysis skipped for {item_id}: {e}")
 
-        # Step 2: AI categorization
+        # ── Step 3: Audio transcript — works for YouTube, Instagram, Facebook ─
+        transcript = ""
+        try:
+            from services.extraction import extract_transcript_from_video
+            await db.processing_jobs.update_one(
+                {"item_id": item_id},
+                {"$set": {"step_name": "transcript_extraction"}}
+            )
+            transcript = await extract_transcript_from_video(url, platform)
+            if transcript:
+                metadata["transcript"] = transcript
+                logger.info(f"Transcript extracted for {item_id}: {len(transcript)} chars")
+        except Exception as e:
+            logger.warning(f"Transcript extraction skipped for {item_id}: {e}")
+
+        # ── Step 4: AI categorization with full context ──────────────────────
         await db.processing_jobs.update_one(
             {"item_id": item_id},
             {"$set": {"step_name": "ai_categorization"}}
         )
         ai_result = await categorize_content(metadata)
-        logger.info(f"AI categorization for {item_id}: {ai_result.get('category', 'N/A')}")
+        logger.info(f"AI done for {item_id}: category={ai_result.get('category')}, "
+                    f"key_points={len(ai_result.get('key_points', []))}, "
+                    f"steps={len(ai_result.get('steps', []))}")
 
-        # Update item with AI results
+        # ── Update item with all AI + enrichment results ─────────────────────
         ai_update = {
             "title": ai_result.get("title") or metadata.get("title", "Untitled"),
             "summary": ai_result.get("summary", ""),
-            "category": ai_result.get("category", "Uncategorized"),
+            "key_points": ai_result.get("key_points", []),
+            "steps": ai_result.get("steps", []),
+            "ingredients": ai_result.get("ingredients", []),
+            "transcript_excerpt": ai_result.get("transcript_excerpt", ""),
+            "visual_text": visual_text[:500] if visual_text else "",
+            "category": ai_result.get("category", "Other"),
             "sub_category": ai_result.get("sub_category", ""),
             "tags": ai_result.get("tags", []),
             "is_place_related": ai_result.get("is_place_related", False),
@@ -522,18 +586,15 @@ async def update_item(item_id: str, req: UpdateItemRequest, user: dict = Depends
         raise HTTPException(status_code=404, detail="Item not found")
 
     update_fields = {"updated_at": datetime.now(timezone.utc)}
-    if req.title is not None:
-        update_fields["title"] = req.title
-    if req.summary is not None:
-        update_fields["summary"] = req.summary
-    if req.category is not None:
-        update_fields["category"] = req.category
-    if req.sub_category is not None:
-        update_fields["sub_category"] = req.sub_category
-    if req.tags is not None:
-        update_fields["tags"] = req.tags
-    if req.notes is not None:
-        update_fields["notes"] = req.notes
+    if req.title is not None:       update_fields["title"] = req.title
+    if req.summary is not None:     update_fields["summary"] = req.summary
+    if req.category is not None:    update_fields["category"] = req.category
+    if req.sub_category is not None: update_fields["sub_category"] = req.sub_category
+    if req.tags is not None:        update_fields["tags"] = req.tags
+    if req.notes is not None:       update_fields["notes"] = req.notes
+    if req.key_points is not None:  update_fields["key_points"] = req.key_points
+    if req.steps is not None:       update_fields["steps"] = req.steps
+    if req.ingredients is not None: update_fields["ingredients"] = req.ingredients
 
     await db.items.update_one({"_id": ObjectId(item_id)}, {"$set": update_fields})
     updated = await db.items.find_one({"_id": ObjectId(item_id)})

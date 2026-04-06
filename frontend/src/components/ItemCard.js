@@ -1,7 +1,7 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { ExternalLink, Clock, CheckCircle, AlertCircle, RefreshCw } from 'lucide-react';
+import { ExternalLink, CheckCircle, AlertCircle } from 'lucide-react';
 
 const PLATFORM_COLORS = {
   instagram: 'bg-gradient-to-br from-purple-500 to-pink-500',
@@ -15,17 +15,70 @@ const PLATFORM_LABELS = {
   facebook: 'Facebook',
 };
 
-const STATUS_ICONS = {
-  processing: Clock,
-  completed: CheckCircle,
-  failed: AlertCircle,
-};
-
 const VIDEO_PLACEHOLDER = 'https://static.prod-images.emergentagent.com/jobs/7ecda9fa-840f-42b6-a697-5367aaabdf99/images/54cc39fbc674b1e47eb9c19e535e10a091317d4c51804e073bbaf99dac7b9666.png';
 
+// ── Skeleton card shown while a video is being processed ─────────────────────
+export function ProcessingCard({ item, index = 0 }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3, delay: index * 0.05 }}
+      className="bg-white border border-border-default rounded-2xl shadow-sm overflow-hidden"
+    >
+      {/* Animated skeleton thumbnail */}
+      <div className="relative aspect-[9/16] bg-surface-hover overflow-hidden">
+        {/* Shimmer sweep */}
+        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/50 to-transparent animate-[shimmer_1.5s_infinite]" />
+
+        {/* Platform badge */}
+        {item?.platform && (
+          <div className="absolute top-3 left-3">
+            <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-[10px] uppercase tracking-wider font-semibold text-white ${PLATFORM_COLORS[item.platform] || 'bg-text-secondary'}`}>
+              {PLATFORM_LABELS[item.platform] || item.platform}
+            </span>
+          </div>
+        )}
+
+        {/* Pulsing processing badge */}
+        <div className="absolute top-3 right-3">
+          <span className="flex h-3 w-3">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-yellow-400 opacity-75" />
+            <span className="relative inline-flex rounded-full h-3 w-3 bg-yellow-500" />
+          </span>
+        </div>
+
+        {/* Bottom skeleton lines */}
+        <div className="absolute bottom-0 left-0 right-0 p-3 space-y-2">
+          <div className="h-3 bg-white/30 rounded-full w-4/5 animate-pulse" />
+          <div className="h-2 bg-white/20 rounded-full w-2/5 animate-pulse" />
+        </div>
+      </div>
+
+      {/* Processing label */}
+      <div className="px-3 py-2.5">
+        <div className="flex items-center gap-1.5">
+          <span className="flex h-2 w-2">
+            <span className="animate-ping absolute inline-flex h-2 w-2 rounded-full bg-yellow-400 opacity-75" />
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-yellow-500" />
+          </span>
+          <span className="text-xs text-yellow-600 font-medium">Analysing content…</span>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+// ── Normal item card ──────────────────────────────────────────────────────────
 export default function ItemCard({ item, index = 0 }) {
   const navigate = useNavigate();
-  const StatusIcon = STATUS_ICONS[item.source_status] || Clock;
+
+  // Show skeleton while processing
+  if (item.source_status === 'processing') {
+    return <ProcessingCard item={item} index={index} />;
+  }
+
+  const isFailed = item.source_status === 'failed';
 
   return (
     <motion.div
@@ -56,17 +109,17 @@ export default function ItemCard({ item, index = 0 }) {
 
         {/* Status badge */}
         <div className="absolute top-3 right-3">
-          <StatusIcon className={`w-4 h-4 ${
-            item.source_status === 'completed' ? 'text-green-400' :
-            item.source_status === 'failed' ? 'text-red-400' :
-            'text-yellow-400 animate-pulse'
-          }`} />
+          {isFailed ? (
+            <AlertCircle className="w-4 h-4 text-red-400" />
+          ) : (
+            <CheckCircle className="w-4 h-4 text-green-400" />
+          )}
         </div>
 
         {/* Bottom info */}
         <div className="absolute bottom-0 left-0 right-0 p-3">
           <h3 className="text-white text-sm font-semibold line-clamp-2 leading-snug">
-            {item.title || 'Processing...'}
+            {item.title || 'Untitled'}
           </h3>
           {item.category && (
             <span className="inline-block mt-1.5 px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider font-medium bg-white/20 text-white/90 backdrop-blur-sm">
