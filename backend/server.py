@@ -403,6 +403,62 @@ async def save_url(req: SaveRequest, background_tasks: BackgroundTasks, user: di
     background_tasks.add_task(process_item, item_id, url, platform, user["id"])
     return {"item_id": item_id, "status": "processing"}
 
+# ─── Category → Collection Auto-Assignment ───────────────────────────────────
+CATEGORY_COLLECTION_MAP = {
+    "Fitness & Health":      "Fitness & Health",
+    "Sports":                "Fitness & Health",
+    "Travel":                "Travel",
+    "Nature & Outdoors":     "Travel",
+    "Food & Recipes":        "Food & Recipes",
+    "Technology":            "Technology",
+    "Education & Learning":  "Learning",
+    "DIY & Crafts":          "Learning",
+    "Entertainment":         "Entertainment",
+    "Comedy & Humor":        "Entertainment",
+    "Music":                 "Entertainment",
+    "Gaming":                "Entertainment",
+    "Art & Creativity":      "Entertainment",
+    "Finance & Money":       "Finance",
+    "Career & Business":     "Finance",
+    "Fashion & Beauty":      "Fashion & Style",
+    "Skincare":              "Fashion & Style",
+    "Shopping":              "Fashion & Style",
+    "Parenting":             "Learning",
+    "Motivation":            "Learning",
+    "Relationships":         "Entertainment",
+    "Pets & Animals":        "Entertainment",
+}
+
+async def auto_assign_to_collection(item_id: str, user_id: str, ai_result: dict):
+    """Auto-assign an item to a matching collection based on its AI category."""
+    try:
+        category = ai_result.get("category", "")
+        target_name = CATEGORY_COLLECTION_MAP.get(category)
+        if not target_name:
+            return
+        # Find matching collection (case-insensitive)
+        coll = await db.collections.find_one({
+            "user_id": user_id,
+            "name": {"$regex": f"^{re.escape(target_name)}$", "$options": "i"}
+        })
+        if not coll:
+            return
+        collection_id = str(coll["_id"])
+        # Only insert if not already in the collection
+        existing = await db.item_collection_map.find_one({
+            "collection_id": collection_id,
+            "item_id": item_id
+        })
+        if not existing:
+            await db.item_collection_map.insert_one({
+                "collection_id": collection_id,
+                "item_id": item_id,
+                "added_at": datetime.now(timezone.utc)
+            })
+            logger.info(f"Auto-assigned item {item_id} to collection '{target_name}'")
+    except Exception:
+        pass  # never crash the pipeline
+
 # ─── Background Processing Pipeline ──────────────────────────────────────────
 async def process_item(item_id: str, url: str, platform: str, user_id: str):
     try:
@@ -505,6 +561,9 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
                         "geocode_source": "nominatim",
                         "created_at": datetime.now(timezone.utc)
                     })
+
+        # ── Step 5: Auto-assign to matching collection ───────────────────────
+        await auto_assign_to_collection(item_id, user_id, ai_result)
 
         # Complete processing
         await db.processing_jobs.update_one(
@@ -672,6 +731,23 @@ async def delete_collection(collection_id: str, user: dict = Depends(get_current
     await db.collections.delete_one({"_id": ObjectId(collection_id)})
     await db.item_collection_map.delete_many({"collection_id": collection_id})
     return {"message": "Collection deleted"}
+
+@app.get("/api/collections/{collection_id}/available-items")
+async def get_available_items(collection_id: str, user: dict = Depends(get_current_user)):
+    """Return all items not yet in this collection, for the manual picker."""
+    coll = await db.collections.find_one({"_id": ObjectId(collection_id), "user_id": user["id"]})
+    if not coll:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    # IDs already in the collection
+    in_coll = set()
+    async for mapping in db.item_collection_map.find({"collection_id": collection_id}):
+        in_coll.add(mapping["item_id"])
+    items = []
+    async for doc in db.items.find({"user_id": user["id"], "source_status": "completed"}).sort("created_at", -1).limit(200):
+        serialized = serialize_doc(doc)
+        serialized["in_collection"] = serialized["id"] in in_coll
+        items.append(serialized)
+    return {"items": items, "collection_name": coll["name"]}
 
 @app.post("/api/collections/{collection_id}/items")
 async def add_item_to_collection(collection_id: str, req: AddItemToCollectionRequest, user: dict = Depends(get_current_user)):

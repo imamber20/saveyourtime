@@ -36,6 +36,7 @@ export const collectionsAPI = {
   delete: (id) => api.delete(`/api/collections/${id}`),
   addItem: (collectionId, itemId) => api.post(`/api/collections/${collectionId}/items`, { item_id: itemId }),
   removeItem: (collectionId, itemId) => api.delete(`/api/collections/${collectionId}/items/${itemId}`),
+  getAvailableItems: (collectionId) => api.get(`/api/collections/${collectionId}/available-items`),
 };
 
 // Search

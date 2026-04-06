@@ -5,7 +5,7 @@ import { itemsAPI, collectionsAPI, formatApiErrorDetail } from '../services/api'
 import {
   ArrowLeft, ExternalLink, Edit3, Trash2, RefreshCw, MapPin, Tag,
   Clock, CheckCircle, AlertCircle, FolderPlus, Loader2,
-  List, ChefHat, Footprints, FileText
+  List, ChefHat, Footprints
 } from 'lucide-react';
 
 const VIDEO_PLACEHOLDER = 'https://static.prod-images.emergentagent.com/jobs/7ecda9fa-840f-42b6-a697-5367aaabdf99/images/54cc39fbc674b1e47eb9c19e535e10a091317d4c51804e073bbaf99dac7b9666.png';
@@ -380,18 +380,6 @@ export default function ItemDetailPage() {
                 </div>
               )}
 
-              {/* Transcript excerpt */}
-              {item.transcript_excerpt && (
-                <div>
-                  <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2 flex items-center gap-1.5">
-                    <FileText className="w-3.5 h-3.5" /> Audio Transcript (excerpt)
-                  </h3>
-                  <p className="text-sm text-text-secondary leading-relaxed italic border-l-2 border-border-default pl-3">
-                    "{item.transcript_excerpt}"
-                  </p>
-                </div>
-              )}
-
               {/* Notes */}
               {item.notes && (
                 <div>
@@ -404,13 +392,19 @@ export default function ItemDetailPage() {
               {item.places && item.places.length > 0 && (
                 <div>
                   <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2">Places</h3>
-                  <div className="space-y-2">
+                  <div className="flex flex-wrap gap-2">
                     {item.places.map(place => (
-                      <div key={place.id} className="flex items-center gap-2 text-sm">
-                        <MapPin className="w-4 h-4 text-brand" />
-                        <span>{place.name}</span>
-                        {place.address && <span className="text-text-secondary text-xs truncate">- {place.address}</span>}
-                      </div>
+                      <button
+                        key={place.id}
+                        onClick={() => place.latitude && place.longitude
+                          ? navigate(`/map?flyTo=${place.latitude},${place.longitude}`)
+                          : navigate('/map')
+                        }
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-brand/10 text-brand text-sm font-medium hover:bg-brand/20 transition-colors"
+                      >
+                        <MapPin className="w-3.5 h-3.5" />
+                        {place.name}
+                      </button>
                     ))}
                   </div>
                 </div>

@@ -1,4 +1,5 @@
 import re
+import base64
 import logging
 import httpx
 from bs4 import BeautifulSoup
@@ -129,6 +130,22 @@ async def _extract_ytdlp_metadata(url: str, metadata: Dict) -> Dict:
 
             metadata["thumbnail_url"] = thumb_url or (thumb_list[0] if thumb_list else "")
             metadata["thumbnail_urls"] = thumb_list[:4]  # max 4 frames
+
+            # Cache thumbnail as base64 data-URI to survive CDN expiry (especially Instagram)
+            main_thumb = metadata["thumbnail_url"]
+            if main_thumb and not main_thumb.startswith("data:"):
+                try:
+                    async with httpx.AsyncClient(timeout=8, follow_redirects=True) as hclient:
+                        r = await hclient.get(main_thumb, headers={"User-Agent": "Mozilla/5.0"})
+                        if r.status_code == 200 and len(r.content) < 250_000:
+                            ct = r.headers.get("content-type", "image/jpeg").split(";")[0]
+                            b64 = base64.b64encode(r.content).decode()
+                            data_uri = f"data:{ct};base64,{b64}"
+                            metadata["thumbnail_url"] = data_uri
+                            if metadata["thumbnail_urls"]:
+                                metadata["thumbnail_urls"][0] = data_uri
+                except Exception as e:
+                    logger.warning(f"Thumbnail caching failed: {e}")
 
             logger.info(f"yt-dlp extracted '{metadata['title']}' with {len(thumb_list)} thumbnails")
         else:
