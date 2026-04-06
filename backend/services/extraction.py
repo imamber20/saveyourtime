@@ -83,6 +83,31 @@ def detect_platform(url: str) -> Optional[str]:
     return None
 
 # ─── Metadata Extraction ─────────────────────────────────────────────────────
+async def quick_availability_check(url: str) -> dict:
+    """Fast pre-check: run yt-dlp --print title (no download, 10s timeout).
+    Returns {"available": bool, "title": str, "reason": str}
+    """
+    try:
+        result = subprocess.run(
+            [YTDLP_PATH, "--print", "title", "--no-download", "--no-playlist",
+             "--socket-timeout", "8", url],
+            capture_output=True, text=True, timeout=12
+        )
+        combined = (result.stdout + result.stderr).lower()
+        if any(p in combined for p in _UNAVAILABLE_PATTERNS):
+            return {"available": False, "title": "", "reason": "Content removed or no longer accessible"}
+        if result.returncode == 0 and result.stdout.strip():
+            return {"available": True, "title": result.stdout.strip(), "reason": ""}
+        # Non-zero but no unavailable signal — network issue or unsupported URL variant
+        error_preview = result.stderr.strip()[:200] if result.stderr else "Unknown error"
+        return {"available": False, "title": "", "reason": error_preview}
+    except subprocess.TimeoutExpired:
+        # Timeout ≠ unavailable — just a slow network; let the full pipeline decide
+        return {"available": True, "title": "", "reason": "timeout"}
+    except Exception as e:
+        return {"available": True, "title": "", "reason": str(e)}
+
+
 async def extract_metadata(url: str, platform: str) -> Dict:
     metadata = {
         "title": "",

@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
-from services.extraction import validate_url, detect_platform, extract_metadata, ContentUnavailableError
+from services.extraction import validate_url, detect_platform, extract_metadata, ContentUnavailableError, quick_availability_check
 from services.ai_service import categorize_content
 from services.geocoding import geocode_place
 
@@ -351,6 +351,15 @@ async def reset_password(req: ResetPasswordRequest):
     await db.password_reset_tokens.update_one({"token": req.token}, {"$set": {"used": True}})
     return {"message": "Password reset successfully"}
 
+# ─── URL Availability Check ──────────────────────────────────────────────────
+@app.get("/api/check-url")
+async def check_url_endpoint(url: str, user: dict = Depends(get_current_user)):
+    """Quick availability check without saving. Returns {available, title, reason}."""
+    if not validate_url(url):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    result = await quick_availability_check(url)
+    return result
+
 # ─── Save Flow ────────────────────────────────────────────────────────────────
 @app.post("/api/save")
 async def save_url(req: SaveRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
@@ -361,6 +370,15 @@ async def save_url(req: SaveRequest, background_tasks: BackgroundTasks, user: di
     platform = detect_platform(url)
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported platform. Only Instagram Reels, YouTube Shorts, and Facebook Reels are supported.")
+
+    # Quick availability pre-check — fail fast before creating a DB record.
+    # We only reject on DEFINITIVE signals (removed/private); timeouts pass through.
+    check = await quick_availability_check(url)
+    if not check["available"] and check.get("reason") != "timeout":
+        raise HTTPException(
+            status_code=422,
+            detail={"type": "unavailable", "reason": check["reason"] or "Content not found or no longer accessible"}
+        )
 
     # Check duplicate
     existing = await db.items.find_one({"url": url, "user_id": user["id"]})

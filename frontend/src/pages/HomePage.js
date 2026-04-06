@@ -44,7 +44,7 @@ export default function HomePage() {
 
   const handleSave = async (url) => {
     setSaving(true);
-    setSaveMsg(null);
+    setSaveMsg({ type: 'info', text: '⏳ Checking content availability…' });
     try {
       const { data } = await itemsAPI.save(url);
       if (data.status === 'duplicate') {
@@ -54,7 +54,12 @@ export default function HomePage() {
         setTimeout(fetchItems, 400);
       }
     } catch (err) {
-      setSaveMsg({ type: 'error', text: formatApiErrorDetail(err.response?.data?.detail) || 'Failed to save' });
+      const detail = err.response?.data?.detail;
+      // Friendly message for pre-check failures (content removed / private)
+      const text = (detail && typeof detail === 'object' && detail.type === 'unavailable')
+        ? `Content unavailable: ${detail.reason || 'This video has been removed or is no longer accessible.'}`
+        : (formatApiErrorDetail(detail) || 'Failed to save');
+      setSaveMsg({ type: 'error', text });
     } finally {
       setSaving(false);
       setTimeout(() => setSaveMsg(null), 4000);

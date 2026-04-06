@@ -20,6 +20,7 @@ export const authAPI = {
 // Items
 export const itemsAPI = {
   save: (url) => api.post('/api/save', { url }),
+  checkUrl: (url) => api.get('/api/check-url', { params: { url } }),
   list: (params) => api.get('/api/items', { params }),
   get: (id) => api.get(`/api/items/${id}`),
   update: (id, data) => api.put(`/api/items/${id}`, data),
