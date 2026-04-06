@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import { ExternalLink, CheckCircle, AlertCircle, RefreshCw, VideoOff } from 'lucide-react';
 import { itemsAPI } from '../services/api';
 
@@ -66,6 +66,132 @@ export function ProcessingCard({ item, index = 0 }) {
             <span className="relative inline-flex rounded-full h-2 w-2 bg-yellow-500" />
           </span>
           <span className="text-xs text-yellow-600 font-medium">Analysing content…</span>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+// ── Checking tile — shown while pre-save availability check runs ─────────────
+export function CheckingTile({ platform, index = 0 }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3, delay: index * 0.05 }}
+      className="bg-white border border-border-default rounded-2xl shadow-sm overflow-hidden"
+    >
+      <div className="relative aspect-[9/16] bg-surface-hover overflow-hidden">
+        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/50 to-transparent animate-[shimmer_1.5s_infinite]" />
+        {platform && (
+          <div className="absolute top-3 left-3">
+            <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-[10px] uppercase tracking-wider font-semibold text-white ${PLATFORM_COLORS[platform] || 'bg-text-secondary'}`}>
+              {PLATFORM_LABELS[platform] || platform}
+            </span>
+          </div>
+        )}
+        <div className="absolute bottom-0 left-0 right-0 p-3 space-y-2">
+          <div className="h-3 bg-white/30 rounded-full w-4/5 animate-pulse" />
+          <div className="h-2 bg-white/20 rounded-full w-2/5 animate-pulse" />
+        </div>
+      </div>
+      <div className="px-3 py-2.5">
+        <div className="flex items-center gap-1.5">
+          <span className="relative flex h-2 w-2">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-slate-400 opacity-60" />
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-slate-400" />
+          </span>
+          <span className="text-xs text-text-secondary font-medium">Checking link…</span>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+// ── Content-gone tile — animated 404 wave scene, auto-expires ─────────────────
+export function ContentGoneTile({ platform, onExpire, index = 0 }) {
+  const [countdown, setCountdown] = useState(8);
+
+  useEffect(() => {
+    const timer = setInterval(() => setCountdown(c => c - 1), 1000);
+    const expiry = setTimeout(() => { clearInterval(timer); onExpire?.(); }, 8000);
+    return () => { clearInterval(timer); clearTimeout(expiry); };
+  }, [onExpire]);
+
+  const waveStyle = (delay, opacity) => ({
+    animation: `wave 3s ease-in-out ${delay}s infinite`,
+    fill: `rgba(195,107,88,${opacity})`,
+  });
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, scale: 0.9 }}
+      transition={{ duration: 0.3, delay: index * 0.05 }}
+      className="bg-white border border-red-100 rounded-2xl shadow-sm overflow-hidden"
+    >
+      <div className="relative aspect-[9/16] overflow-hidden bg-[#FDF5F0] flex flex-col items-center justify-center">
+        <style>{`
+          @keyframes wave {
+            0%, 100% { transform: translateX(0); }
+            50% { transform: translateX(-20px); }
+          }
+          @keyframes float {
+            0%, 100% { transform: translateY(0px) rotate(-5deg); }
+            50% { transform: translateY(-8px) rotate(5deg); }
+          }
+          @keyframes drift {
+            0%, 100% { transform: translateX(0px); }
+            50% { transform: translateX(6px); }
+          }
+        `}</style>
+
+        {platform && (
+          <div className="absolute top-3 left-3">
+            <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-[10px] uppercase tracking-wider font-semibold text-white ${PLATFORM_COLORS[platform] || 'bg-text-secondary'}`}>
+              {PLATFORM_LABELS[platform] || platform}
+            </span>
+          </div>
+        )}
+
+        {/* Floating paper plane */}
+        <div className="absolute top-8 right-6" style={{ animation: 'float 3s ease-in-out infinite' }}>
+          <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+            <path d="M4 16L28 4L20 28L14 18L4 16Z" fill="#C36B58" fillOpacity="0.7" stroke="#C36B58" strokeWidth="1.5" strokeLinejoin="round"/>
+            <path d="M14 18L20 12" stroke="#C36B58" strokeWidth="1.5" strokeLinecap="round"/>
+          </svg>
+        </div>
+
+        {/* Main text */}
+        <div className="text-center px-4 z-10">
+          <p className="text-xs font-semibold text-[#C36B58] uppercase tracking-widest mb-1">Oops!</p>
+          <p className="text-6xl font-black text-[#2D2017] leading-none tracking-tight">404</p>
+          <p className="text-xs font-medium text-[#6B5449] mt-2">Content not found</p>
+          <p className="text-[10px] text-[#9C7A6E] mt-1">This video was removed or is private</p>
+        </div>
+
+        {/* Animated waves at bottom */}
+        <div className="absolute bottom-0 left-0 right-0">
+          <svg viewBox="0 0 400 80" preserveAspectRatio="none" className="w-full h-14">
+            <path style={waveStyle(0, 0.25)}
+              d="M-40,40 C20,15 80,65 140,40 C200,15 260,65 320,40 C380,15 440,65 440,40 L440,80 L-40,80 Z" />
+            <path style={waveStyle(0.5, 0.15)}
+              d="M-40,50 C20,28 80,72 140,50 C200,28 260,72 320,50 C380,28 440,72 440,50 L440,80 L-40,80 Z" />
+          </svg>
+          {/* Tiny bottle floating on waves */}
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2" style={{ animation: 'drift 2.5s ease-in-out infinite' }}>
+            <svg width="28" height="20" viewBox="0 0 28 20" fill="none">
+              <rect x="8" y="2" width="12" height="14" rx="3" fill="#C36B58" fillOpacity="0.6"/>
+              <rect x="11" y="0" width="6" height="4" rx="1" fill="#9B4E38" fillOpacity="0.7"/>
+              <path d="M10 8 Q14 6 18 8" stroke="white" strokeOpacity="0.5" strokeWidth="1" strokeLinecap="round"/>
+            </svg>
+          </div>
+        </div>
+
+        {/* Countdown ring */}
+        <div className="absolute bottom-2 right-3 text-[9px] font-bold text-[#C36B58]/60">
+          {countdown}s
         </div>
       </div>
     </motion.div>

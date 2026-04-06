@@ -93,14 +93,15 @@ async def quick_availability_check(url: str) -> dict:
              "--socket-timeout", "8", url],
             capture_output=True, text=True, timeout=12
         )
-        combined = (result.stdout + result.stderr).lower()
-        if any(p in combined for p in _UNAVAILABLE_PATTERNS):
+        # Only check stderr for definitive removal signals (stdout contains the title)
+        stderr_lower = result.stderr.lower()
+        if result.returncode != 0 and any(p in stderr_lower for p in _UNAVAILABLE_PATTERNS):
             return {"available": False, "title": "", "reason": "Content removed or no longer accessible"}
-        if result.returncode == 0 and result.stdout.strip():
+        if result.returncode == 0:
             return {"available": True, "title": result.stdout.strip(), "reason": ""}
-        # Non-zero but no unavailable signal — network issue or unsupported URL variant
-        error_preview = result.stderr.strip()[:200] if result.stderr else "Unknown error"
-        return {"available": False, "title": "", "reason": error_preview}
+        # Non-zero but no unavailable pattern — SSL warning, network blip, unsupported variant
+        # Pass through so the full pipeline can handle it
+        return {"available": True, "title": "", "reason": "passthrough"}
     except subprocess.TimeoutExpired:
         # Timeout ≠ unavailable — just a slow network; let the full pipeline decide
         return {"available": True, "title": "", "reason": "timeout"}
