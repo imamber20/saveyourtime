@@ -160,31 +160,45 @@ async def lifespan(app: FastAPI):
     supabase = await acreate_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     logger.info("Supabase client initialised")
 
-    # Seed admin user
+    # Seed / verify admin user
+    admin_id = None
     try:
-        # Check if admin exists by trying to sign in
-        res = await supabase.auth.sign_in_with_password(
+        # Happy path: admin exists with the correct password
+        res      = await supabase.auth.sign_in_with_password(
             {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
         )
         admin_id = res.user.id
-        logger.info(f"Admin user exists: {ADMIN_EMAIL}")
+        logger.info(f"Admin login OK: {ADMIN_EMAIL}")
     except Exception:
-        # Admin doesn't exist yet — create them
+        # Either doesn't exist OR password is stale (e.g. after migration with temp pw)
         try:
-            res = await supabase.auth.admin.create_user({
-                "email": ADMIN_EMAIL,
-                "password": ADMIN_PASSWORD,
-                "email_confirm": True,
-                "user_metadata": {"name": "Admin", "role": "admin"},
-            })
-            admin_id = res.user.id
-            # The trigger creates the profile; ensure role=admin
+            all_users      = await supabase.auth.admin.list_users()
+            existing_admin = next((u for u in all_users if u.email == ADMIN_EMAIL), None)
+
+            if existing_admin:
+                # Exists but wrong password — reset it to the configured value
+                admin_id = existing_admin.id
+                await supabase.auth.admin.update_user_by_id(
+                    admin_id, {"password": ADMIN_PASSWORD}
+                )
+                logger.info(f"Admin password reset to configured value: {ADMIN_EMAIL}")
+            else:
+                # Truly new — create from scratch
+                res      = await supabase.auth.admin.create_user({
+                    "email":         ADMIN_EMAIL,
+                    "password":      ADMIN_PASSWORD,
+                    "email_confirm": True,
+                    "user_metadata": {"name": "Admin", "role": "admin"},
+                })
+                admin_id = res.user.id
+                logger.info(f"Admin user created: {ADMIN_EMAIL}")
+
+            # Ensure profile has role=admin
             await supabase.table("profiles").update({"role": "admin", "name": "Admin"}) \
                 .eq("id", admin_id).execute()
             await seed_default_collections(admin_id)
-            logger.info(f"Admin user seeded: {ADMIN_EMAIL}")
         except Exception as err:
-            logger.warning(f"Admin seeding skipped (may already exist): {err}")
+            logger.warning(f"Admin seeding skipped: {err}")
 
     # Write test credentials to memory dir
     memory_dir = os.environ.get(
