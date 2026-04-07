@@ -1,6 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { itemsAPI, categoriesAPI, formatApiErrorDetail } from '../services/api';
+import { supabase } from '../services/supabase';
+import { useAuth } from '../contexts/AuthContext';
 import SaveUrlInput from '../components/SaveUrlInput';
 import ItemCard, { CheckingTile, ContentGoneTile, DuplicateTile } from '../components/ItemCard';
 import EmptyState from '../components/EmptyState';
@@ -15,6 +17,7 @@ const detectPlatformClient = (url) => {
 };
 
 export default function HomePage() {
+  const { user } = useAuth();
   const [items, setItems] = useState([]);
   const [categories, setCategories] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -24,6 +27,7 @@ export default function HomePage() {
   const [filter, setFilter] = useState({ category: '', platform: '', status: '' });
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const realtimeChannelRef = useRef(null);
 
   const fetchItems = useCallback(async () => {
     try {
@@ -101,11 +105,56 @@ export default function HomePage() {
     setPendingTiles(t => t.filter(x => x.id !== tileId));
   };
 
-  // Poll every 2s while any item is still processing
+  // ── Supabase Realtime subscription ──────────────────────────────────────────
+  // Subscribe once per user session; when any of their items is updated
+  // (e.g. status changes from 'processing' → 'completed'), re-fetch items
+  // from the backend so the grid reflects the latest state instantly.
+  //
+  // Requires these one-time SQL statements in the Supabase SQL editor:
+  //   ALTER TABLE public.items REPLICA IDENTITY FULL;
+  //   ALTER PUBLICATION supabase_realtime ADD TABLE public.items;
+  //   CREATE POLICY "anon_select_items" ON public.items FOR SELECT TO anon USING (true);
+  useEffect(() => {
+    if (!user?.id) return;
+
+    // Clean up any existing channel before creating a new one
+    if (realtimeChannelRef.current) {
+      supabase.removeChannel(realtimeChannelRef.current);
+    }
+
+    const channel = supabase
+      .channel(`items:user:${user.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'items',
+          filter: `user_id=eq.${user.id}`,
+        },
+        (_payload) => {
+          // Re-fetch the full list so filtering/pagination stays consistent
+          fetchItems();
+        }
+      )
+      .subscribe();
+
+    realtimeChannelRef.current = channel;
+
+    return () => {
+      supabase.removeChannel(channel);
+      realtimeChannelRef.current = null;
+    };
+  }, [user?.id, fetchItems]);
+
+  // ── Safety-net poll (10s) ────────────────────────────────────────────────
+  // Falls back to polling when Realtime is not yet enabled for this project.
+  // Once the Realtime DDL above is applied, this poll becomes a no-op
+  // (Realtime events arrive first and are far faster).
   useEffect(() => {
     const hasProcessing = items.some(i => i.source_status === 'processing');
     if (!hasProcessing) return;
-    const interval = setInterval(fetchItems, 2000);
+    const interval = setInterval(fetchItems, 10_000);
     return () => clearInterval(interval);
   }, [items, fetchItems]);
 

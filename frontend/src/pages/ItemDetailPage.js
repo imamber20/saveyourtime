@@ -1,11 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { itemsAPI, collectionsAPI, formatApiErrorDetail } from '../services/api';
+import { itemsAPI, collectionsAPI, placesAPI, formatApiErrorDetail } from '../services/api';
+import { supabase } from '../services/supabase';
+import ChatDrawer from '../components/ChatDrawer';
 import {
   ArrowLeft, ExternalLink, Edit3, Trash2, RefreshCw, MapPin, Tag,
   Clock, CheckCircle, AlertCircle, FolderPlus, Loader2,
-  List, ChefHat, Footprints
+  List, ChefHat, Footprints, PenLine, Check, X, MessageSquare
 } from 'lucide-react';
 
 const VIDEO_PLACEHOLDER = 'https://static.prod-images.emergentagent.com/jobs/7ecda9fa-840f-42b6-a697-5367aaabdf99/images/54cc39fbc674b1e47eb9c19e535e10a091317d4c51804e073bbaf99dac7b9666.png';
@@ -23,11 +25,53 @@ export default function ItemDetailPage() {
   const [collections, setCollections] = useState([]);
   const [showCollPicker, setShowCollPicker] = useState(false);
   const [error, setError] = useState('');
+  const realtimeChannelRef = useRef(null);
+  const [correctingPlaceId, setCorrectingPlaceId] = useState(null);
+  const [correctionInput, setCorrectionInput] = useState('');
+  const [correctionSaving, setCorrectionSaving] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
 
   useEffect(() => {
     fetchItem();
     fetchCollections();
   }, [id]);
+
+  // ── Supabase Realtime: watch this item for status updates ─────────────────
+  // Subscribe whenever the item is in 'processing' state so the detail view
+  // automatically refreshes when the backend finishes processing.
+  useEffect(() => {
+    if (!id) return;
+
+    // Clean up previous channel if id changed
+    if (realtimeChannelRef.current) {
+      supabase.removeChannel(realtimeChannelRef.current);
+      realtimeChannelRef.current = null;
+    }
+
+    const channel = supabase
+      .channel(`item:detail:${id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'items',
+          filter: `id=eq.${id}`,
+        },
+        (_payload) => {
+          // Re-fetch from our backend (includes places, collections, etc.)
+          fetchItem();
+        }
+      )
+      .subscribe();
+
+    realtimeChannelRef.current = channel;
+
+    return () => {
+      supabase.removeChannel(channel);
+      realtimeChannelRef.current = null;
+    };
+  }, [id]); // intentionally omit fetchItem from deps — we only want to subscribe once per item ID
 
   const fetchItem = async () => {
     try {
@@ -99,6 +143,22 @@ export default function ItemDetailPage() {
     } catch {}
   };
 
+  const handleSaveCorrection = async (placeId) => {
+    const addr = correctionInput.trim();
+    if (!addr) return;
+    setCorrectionSaving(true);
+    try {
+      await placesAPI.correct(placeId, addr);
+      setCorrectingPlaceId(null);
+      setCorrectionInput('');
+      fetchItem(); // refresh to show new coords
+    } catch (err) {
+      setError(formatApiErrorDetail(err.response?.data?.detail) || 'Could not geocode that address');
+    } finally {
+      setCorrectionSaving(false);
+    }
+  };
+
   if (loading) return (
     <div className="flex items-center justify-center py-20">
       <Loader2 className="w-8 h-8 text-brand animate-spin" />
@@ -152,6 +212,10 @@ export default function ItemDetailPage() {
               Max retries
             </span>
           )}
+          <button onClick={() => setChatOpen(true)} data-testid="ask-ai-button"
+            className="p-2.5 rounded-full border border-brand/30 bg-brand/5 hover:bg-brand/10 transition-colors" aria-label="Ask AI">
+            <MessageSquare className="w-4 h-4 text-brand" />
+          </button>
           <button onClick={() => setEditing(!editing)} data-testid="edit-button"
             className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors" aria-label="Edit">
             <Edit3 className="w-4 h-4 text-text-secondary" />
@@ -404,19 +468,73 @@ export default function ItemDetailPage() {
               {item.places && item.places.length > 0 && (
                 <div>
                   <h3 className="text-xs uppercase tracking-wider font-semibold text-text-secondary mb-2">Places</h3>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex flex-col gap-2">
                     {item.places.map(place => (
-                      <button
-                        key={place.id}
-                        onClick={() => place.latitude && place.longitude
-                          ? navigate(`/map?flyTo=${place.latitude},${place.longitude}`)
-                          : navigate('/map')
-                        }
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-brand/10 text-brand text-sm font-medium hover:bg-brand/20 transition-colors"
-                      >
-                        <MapPin className="w-3.5 h-3.5" />
-                        {place.name}
-                      </button>
+                      <div key={place.id}>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => place.latitude && place.longitude
+                              ? navigate(`/map?flyTo=${place.latitude},${place.longitude}`)
+                              : navigate('/map')
+                            }
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-brand/10 text-brand text-sm font-medium hover:bg-brand/20 transition-colors"
+                          >
+                            <MapPin className="w-3.5 h-3.5" />
+                            {place.name}
+                          </button>
+                          {/* Correction toggle */}
+                          <button
+                            onClick={() => {
+                              if (correctingPlaceId === place.id) {
+                                setCorrectingPlaceId(null);
+                                setCorrectionInput('');
+                              } else {
+                                setCorrectingPlaceId(place.id);
+                                setCorrectionInput(place.address || '');
+                              }
+                            }}
+                            title="Suggest address correction"
+                            className="p-1 rounded-full text-text-secondary hover:text-brand hover:bg-brand/10 transition-colors"
+                          >
+                            <PenLine className="w-3.5 h-3.5" />
+                          </button>
+                          {place.geocode_source && (
+                            <span className="text-[10px] text-text-secondary opacity-60">
+                              via {place.geocode_source}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Inline correction input */}
+                        {correctingPlaceId === place.id && (
+                          <div className="mt-2 ml-1 flex items-center gap-2">
+                            <input
+                              autoFocus
+                              value={correctionInput}
+                              onChange={e => setCorrectionInput(e.target.value)}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') handleSaveCorrection(place.id);
+                                if (e.key === 'Escape') { setCorrectingPlaceId(null); setCorrectionInput(''); }
+                              }}
+                              placeholder="Enter correct address…"
+                              className="flex-1 px-3 py-1.5 border border-border-default rounded-lg text-xs focus:border-brand outline-none"
+                            />
+                            <button
+                              onClick={() => handleSaveCorrection(place.id)}
+                              disabled={correctionSaving}
+                              className="p-1.5 rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-50 transition-colors"
+                            >
+                              {correctionSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                            </button>
+                            <button
+                              onClick={() => { setCorrectingPlaceId(null); setCorrectionInput(''); }}
+                              className="p-1.5 rounded-lg border border-border-default hover:bg-surface-hover transition-colors"
+                            >
+                              <X className="w-3.5 h-3.5 text-text-secondary" />
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -439,6 +557,15 @@ export default function ItemDetailPage() {
           )}
         </div>
       </div>
+
+      {/* Per-item AI chat drawer */}
+      <ChatDrawer
+        isOpen={chatOpen}
+        onClose={() => setChatOpen(false)}
+        mode="item"
+        itemId={id}
+        itemTitle={item?.title}
+      />
     </motion.div>
   );
 }

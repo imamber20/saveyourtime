@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 import jwt as pyjwt
 from fastapi import FastAPI, HTTPException, Request, Response, Depends, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from supabase import acreate_client, AsyncClient
 
@@ -588,23 +589,48 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
             "source_status":      "completed",
         })
 
+        # ── Step 4b: Embedding generation (for global chat vector search) ───────
+        try:
+            from services.ai_service import generate_embedding
+            embed_text = " ".join(filter(None, [
+                ai_result.get("title") or metadata.get("title", ""),
+                ai_result.get("summary", ""),
+                ai_result.get("category", ""),
+                " ".join(ai_result.get("key_points", [])[:5]),
+                ai_result.get("transcript_excerpt", "")[:300],
+            ]))
+            if embed_text.strip():
+                embedding = await generate_embedding(embed_text)
+                if embedding:
+                    await update_item_fields({"embedding": embedding})
+                    logger.info(f"Embedding stored for {item_id}")
+        except Exception as e:
+            logger.warning(f"Embedding generation skipped for {item_id}: {e}")
+
         # ── Step 5: Geocoding ─────────────────────────────────────────────────
         if ai_result.get("is_place_related") and ai_result.get("places"):
             await update_job({"step_name": "geocoding"})
+            # Build context hint for disambiguation (e.g. "Kyoto travel reel")
+            item_context = " ".join(filter(None, [
+                metadata.get("title", ""),
+                ai_result.get("category", ""),
+                ai_result.get("sub_category", ""),
+            ]))[:120]
+
             for place_entry in ai_result["places"][:5]:
                 display_name = (
                     place_entry.split(",")[0].strip() if "," in place_entry else place_entry
                 )
-                coords = await geocode_place(place_entry)
+                coords = await geocode_place(place_entry, context=item_context)
                 if coords:
                     await supabase.table("places").insert({
-                        "item_id":       item_id,
-                        "name":          display_name,
-                        "address":       coords.get("address", ""),
-                        "latitude":      coords["lat"],
-                        "longitude":     coords["lon"],
-                        "geocode_source": "nominatim",
-                        "created_at":    now(),
+                        "item_id":        item_id,
+                        "name":           display_name,
+                        "address":        coords.get("address", ""),
+                        "latitude":       coords["lat"],
+                        "longitude":      coords["lon"],
+                        "geocode_source": coords.get("source", "nominatim"),
+                        "created_at":     now(),
                     }).execute()
 
         # ── Step 6: Auto-assign to collection ────────────────────────────────
@@ -996,4 +1022,242 @@ async def retry_processing(item_id: str, background_tasks: BackgroundTasks,
         "message":          "Processing restarted",
         "retry_count":      retry_count + 1,
         "retries_remaining": MAX_RETRIES - retry_count - 1,
+    }
+
+
+# ── Place correction ──────────────────────────────────────────────────────────
+
+class PlaceCorrectionRequest(BaseModel):
+    address_override: str
+
+@app.put("/api/places/{place_id}")
+async def correct_place(
+    place_id: str,
+    body: PlaceCorrectionRequest,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Re-geocode a place using a user-supplied address override.
+    Uses HERE Geocoding when available; falls back to Nominatim.
+    Ownership is verified via the parent item's user_id.
+    """
+    address = body.address_override.strip()
+    if not address:
+        raise HTTPException(status_code=400, detail="address_override is required")
+
+    # Verify ownership: the place must belong to one of this user's items
+    place_res = await supabase.table("places").select("*, items(user_id)") \
+        .eq("id", place_id).maybe_single().execute()
+    if not place_res.data:
+        raise HTTPException(status_code=404, detail="Place not found")
+
+    place = place_res.data
+    owner_id = (place.get("items") or {}).get("user_id")
+    if owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your place")
+
+    # Re-geocode with the user-supplied address
+    from services.geocoding import _nominatim_search
+    from services.place_search import _here_geocode
+    import os
+
+    coords = None
+    source = "nominatim"
+
+    if os.getenv("HERE_API_KEY"):
+        coords = await _here_geocode(address)
+        if coords:
+            source = "here_override"
+
+    if not coords:
+        coords = await _nominatim_search(address)
+        if coords:
+            source = "nominatim_override"
+
+    if not coords:
+        raise HTTPException(status_code=422, detail=f"Could not geocode address: {address!r}")
+
+    updated = {
+        "address":        coords.get("address", address),
+        "latitude":       coords["lat"],
+        "longitude":      coords["lon"],
+        "geocode_source": source,
+    }
+    await supabase.table("places").update(updated).eq("id", place_id).execute()
+
+    return {"id": place_id, **updated}
+
+
+# ── Chat endpoints (Phase 4) ──────────────────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    role: str     # "user" | "assistant"
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+
+
+@app.post("/api/chat/item/{item_id}")
+async def chat_with_item(
+    item_id: str,
+    body: ChatRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Stream a per-item chat response grounded in the saved item's content."""
+    # Fetch item (verifies ownership)
+    item_res = await supabase.table("items").select("*") \
+        .eq("id", item_id).eq("user_id", user["id"]).maybe_single().execute()
+    if not item_res.data:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Also fetch places so the chatbot knows about them
+    places_res = await supabase.table("places").select("name, address") \
+        .eq("item_id", item_id).execute()
+    item = dict(item_res.data)
+    item["places"] = places_res.data or []
+
+    messages = [{"role": m.role, "content": m.content} for m in body.messages]
+
+    from services.chat_service import item_chat
+    stream_gen = await item_chat(item, messages)
+
+    return StreamingResponse(
+        stream_gen,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/chat/library")
+async def chat_with_library(
+    body: ChatRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Stream a library-wide chat response using semantic search across all saved items."""
+    messages = [{"role": m.role, "content": m.content} for m in body.messages]
+
+    from services.chat_service import library_chat
+    stream_gen = await library_chat(messages, user["id"], supabase)
+
+    return StreamingResponse(
+        stream_gen,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── Hype endpoints (Phase 5) ──────────────────────────────────────────────────
+
+@app.post("/api/items/{item_id}/hype")
+async def hype_item(item_id: str, user: dict = Depends(get_current_user)):
+    """Add a hype for an item. Idempotent — re-hyping the same item is a no-op."""
+    item_res = await supabase.table("items").select("id, hype_count, user_id") \
+        .eq("id", item_id).maybe_single().execute()
+    if not item_res.data:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    try:
+        await supabase.table("hypes").insert({
+            "item_id": item_id,
+            "user_id": user["id"],
+        }).execute()
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "23505" in str(e):
+            pass  # Already hyped — idempotent
+        else:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    updated = await supabase.table("items").select("hype_count") \
+        .eq("id", item_id).maybe_single().execute()
+    hype_count = (updated.data or {}).get("hype_count", 0)
+    return {"item_id": item_id, "hype_count": hype_count, "hyped": True}
+
+
+@app.delete("/api/items/{item_id}/hype")
+async def unhype_item(item_id: str, user: dict = Depends(get_current_user)):
+    """Remove a hype (un-hype). Idempotent."""
+    await supabase.table("hypes") \
+        .delete() \
+        .eq("item_id", item_id) \
+        .eq("user_id", user["id"]) \
+        .execute()
+
+    updated = await supabase.table("items").select("hype_count") \
+        .eq("id", item_id).maybe_single().execute()
+    hype_count = (updated.data or {}).get("hype_count", 0)
+    return {"item_id": item_id, "hype_count": hype_count, "hyped": False}
+
+
+@app.get("/api/items/{item_id}/hype")
+async def get_hype_status(item_id: str, user: dict = Depends(get_current_user)):
+    """Return current hype_count and whether the current user has hyped this item."""
+    item_res = await supabase.table("items").select("hype_count") \
+        .eq("id", item_id).maybe_single().execute()
+    if not item_res.data:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    hype_res = await supabase.table("hypes").select("item_id") \
+        .eq("item_id", item_id).eq("user_id", user["id"]).limit(1).execute()
+    return {
+        "item_id":    item_id,
+        "hype_count": (item_res.data or {}).get("hype_count", 0),
+        "hyped":      bool(hype_res.data),
+    }
+
+
+@app.get("/api/trending")
+async def get_trending(
+    category: str = Query(default=""),
+    period:   str = Query(default="week"),   # "day" | "week" | "all"
+    limit:    int = Query(default=20, le=50),
+    page:     int = Query(default=1, ge=1),
+    user: dict = Depends(get_current_user),
+):
+    """Return publicly hyped items sorted by hype_count (cross-user trending feed)."""
+    skip = (page - 1) * limit
+
+    query = supabase.table("items") \
+        .select("*, count", count="exact") \
+        .eq("is_public", True) \
+        .gt("hype_count", 0) \
+        .order("hype_count", desc=True)
+
+    if period == "day":
+        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        query = query.gte("updated_at", since)
+    elif period == "week":
+        since = (datetime.now(timezone.utc) - timedelta(weeks=1)).isoformat()
+        query = query.gte("updated_at", since)
+
+    if category:
+        query = query.ilike("category", f"%{category}%")
+
+    res = await query.range(skip, skip + limit - 1).execute()
+    items = res.data or []
+    total = res.count or 0
+
+    if items:
+        item_ids = [it["id"] for it in items]
+        hype_res = await supabase.table("hypes").select("item_id") \
+            .eq("user_id", user["id"]) \
+            .in_("item_id", item_ids) \
+            .execute()
+        hyped_ids = {h["item_id"] for h in (hype_res.data or [])}
+        for it in items:
+            it["user_hyped"] = it["id"] in hyped_ids
+            it.pop("embedding", None)
+            it.pop("notes", None)
+
+    return {
+        "items": items,
+        "total": total,
+        "page":  page,
+        "pages": (total + limit - 1) // limit if total else 1,
     }

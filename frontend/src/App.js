@@ -11,6 +11,7 @@ import CollectionsPage from './pages/CollectionsPage';
 import CollectionDetailPage from './pages/CollectionDetailPage';
 import MapPage from './pages/MapPage';
 import SettingsPage from './pages/SettingsPage';
+import TrendingPage from './pages/TrendingPage';
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth();
@@ -52,6 +53,7 @@ function App() {
             <Route path="collections" element={<CollectionsPage />} />
             <Route path="collections/:id" element={<CollectionDetailPage />} />
             <Route path="map" element={<MapPage />} />
+            <Route path="trending" element={<TrendingPage />} />
             <Route path="settings" element={<SettingsPage />} />
           </Route>
         </Routes>

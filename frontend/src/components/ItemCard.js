@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ExternalLink, CheckCircle, AlertCircle, RefreshCw, VideoOff } from 'lucide-react';
-import { itemsAPI } from '../services/api';
+import { ExternalLink, CheckCircle, AlertCircle, RefreshCw, VideoOff, Flame } from 'lucide-react';
+import { itemsAPI, hypeAPI } from '../services/api';
 
 const MAX_RETRIES = 3;
 
@@ -318,6 +318,8 @@ export default function ItemCard({ item, index = 0, onRetry }) {
   const navigate = useNavigate();
   const [retrying, setRetrying] = useState(false);
   const [localStatus, setLocalStatus] = useState(item.source_status);
+  const [hyped, setHyped] = useState(item.user_hyped || false);
+  const [hypeCount, setHypeCount] = useState(item.hype_count || 0);
 
   // Show skeleton while processing
   if (localStatus === 'processing') {
@@ -344,6 +346,25 @@ export default function ItemCard({ item, index = 0, onRetry }) {
       // silently ignore — item detail page shows error state
     } finally {
       setRetrying(false);
+    }
+  };
+
+  const handleHype = async (e) => {
+    e.stopPropagation();
+    // Optimistic update
+    const newHyped = !hyped;
+    setHyped(newHyped);
+    setHypeCount(c => newHyped ? c + 1 : Math.max(0, c - 1));
+    try {
+      if (newHyped) {
+        await hypeAPI.hype(item.id);
+      } else {
+        await hypeAPI.unhype(item.id);
+      }
+    } catch {
+      // Rollback on error
+      setHyped(!newHyped);
+      setHypeCount(c => newHyped ? Math.max(0, c - 1) : c + 1);
     }
   };
 
@@ -414,10 +435,10 @@ export default function ItemCard({ item, index = 0, onRetry }) {
         </div>
       </div>
 
-      {/* Tags */}
-      {item.tags && item.tags.length > 0 && (
-        <div className="px-3 py-2.5 flex flex-wrap gap-1.5">
-          {item.tags.slice(0, 3).map((tag) => (
+      {/* Tags + Hype */}
+      <div className="px-3 py-2.5 flex items-center justify-between gap-2">
+        <div className="flex flex-wrap gap-1.5 min-w-0">
+          {(item.tags || []).slice(0, 2).map((tag) => (
             <span
               key={tag}
               className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider font-medium bg-surface-hover text-text-secondary border border-border-default"
@@ -426,7 +447,20 @@ export default function ItemCard({ item, index = 0, onRetry }) {
             </span>
           ))}
         </div>
-      )}
+        {/* Hype button */}
+        <button
+          onClick={handleHype}
+          title={hyped ? 'Un-hype' : 'Hype this!'}
+          className={`flex-shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold transition-all
+            ${hyped
+              ? 'bg-orange-100 text-orange-600 border border-orange-200 hover:bg-orange-200'
+              : 'bg-surface-hover text-text-secondary border border-border-default hover:text-orange-500 hover:border-orange-200 hover:bg-orange-50'
+            }`}
+        >
+          <Flame className={`w-3.5 h-3.5 ${hyped ? 'fill-orange-500 text-orange-500' : ''}`} />
+          {hypeCount > 0 && <span>{hypeCount}</span>}
+        </button>
+      </div>
     </motion.div>
   );
 }

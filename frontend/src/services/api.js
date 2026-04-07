@@ -55,6 +55,43 @@ export const categoriesAPI = {
   list: () => api.get('/api/categories'),
 };
 
+// Places
+export const placesAPI = {
+  correct: (placeId, addressOverride) =>
+    api.put(`/api/places/${placeId}`, { address_override: addressOverride }),
+};
+
+// Chat — returns a native fetch Response (for streaming)
+const BACKEND = process.env.REACT_APP_BACKEND_URL || '';
+export const chatAPI = {
+  streamItemChat: (itemId, messages) =>
+    fetch(`${BACKEND}/api/chat/item/${itemId}`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+    }),
+  streamLibraryChat: (messages) =>
+    fetch(`${BACKEND}/api/chat/library`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+    }),
+};
+
+// Hype
+export const hypeAPI = {
+  getStatus: (itemId) => api.get(`/api/items/${itemId}/hype`),
+  hype:      (itemId) => api.post(`/api/items/${itemId}/hype`),
+  unhype:    (itemId) => api.delete(`/api/items/${itemId}/hype`),
+};
+
+// Trending
+export const trendingAPI = {
+  list: (params) => api.get('/api/trending', { params }),
+};
+
 // Health
 export const healthAPI = {
   check: () => api.get('/api/health'),
