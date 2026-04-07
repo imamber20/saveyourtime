@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Flame, Loader2, TrendingUp } from 'lucide-react';
+import { Flame, Loader2, TrendingUp, AlertTriangle } from 'lucide-react';
 import { trendingAPI, itemsAPI } from '../services/api';
 import EmptyState from '../components/EmptyState';
 
@@ -26,15 +26,16 @@ const PERIODS = [
 
 export default function TrendingPage() {
   const navigate   = useNavigate();
-  const [items, setItems]         = useState([]);
-  const [loading, setLoading]     = useState(true);
-  const [categories, setCategories] = useState([]);
-  const [period, setPeriod]       = useState('week');
-  const [category, setCategory]   = useState('');
-  const [page, setPage]           = useState(1);
-  const [totalPages, setTotalPages] = useState(1);
-  const [savingId, setSavingId]   = useState(null); // item being saved to library
-  const [saveMsg, setSaveMsg]     = useState(null);
+  const [items, setItems]                 = useState([]);
+  const [loading, setLoading]             = useState(true);
+  const [categories, setCategories]       = useState([]);
+  const [period, setPeriod]               = useState('week');
+  const [category, setCategory]           = useState('');
+  const [page, setPage]                   = useState(1);
+  const [totalPages, setTotalPages]       = useState(1);
+  const [savingId, setSavingId]           = useState(null);
+  const [saveMsg, setSaveMsg]             = useState(null);
+  const [migrationPending, setMigrationPending] = useState(false);
 
   const fetchTrending = useCallback(async () => {
     setLoading(true);
@@ -47,6 +48,7 @@ export default function TrendingPage() {
       });
       setItems(data.items || []);
       setTotalPages(data.pages || 1);
+      setMigrationPending(!!data.migration_pending);
 
       // Collect unique categories for filter tabs
       const cats = [...new Set((data.items || []).map(i => i.category).filter(Boolean))];
@@ -92,6 +94,30 @@ export default function TrendingPage() {
           <p className="text-sm text-text-secondary">Most-hyped content across all users</p>
         </div>
       </div>
+
+      {/* Migration pending banner */}
+      {migrationPending && (
+        <div className="mb-5 flex items-start gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+          <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-semibold text-amber-800">One-time setup needed</p>
+            <p className="text-xs text-amber-700 mt-0.5">
+              The Hype &amp; Trending tables need to be created in your Supabase database.
+              Open the{' '}
+              <a
+                href="https://supabase.com/dashboard/project/foktswfeqhzpyrbxzrkm/sql/new"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline font-medium"
+              >
+                Supabase SQL Editor
+              </a>
+              , paste the contents of <code className="bg-amber-100 px-1 rounded">scripts/create_hype_tables.sql</code>{' '}
+              and click Run. Then refresh this page.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Save message */}
       <AnimatePresence>

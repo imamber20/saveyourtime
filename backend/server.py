@@ -12,6 +12,7 @@ from typing import Optional, List
 from contextlib import asynccontextmanager
 
 import jwt as pyjwt
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, Depends, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -155,6 +156,100 @@ async def seed_default_collections(user_id: str):
             }).execute()
 
 
+_HYPE_MIGRATION_SQL = """
+-- Phase 5: Hype & Trending (auto-applied at startup)
+CREATE TABLE IF NOT EXISTS public.hypes (
+  item_id    uuid NOT NULL REFERENCES public.items(id) ON DELETE CASCADE,
+  user_id    uuid NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (item_id, user_id)
+);
+ALTER TABLE public.hypes ENABLE ROW LEVEL SECURITY;
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='hypes' AND policyname='users_manage_own_hypes') THEN
+    CREATE POLICY "users_manage_own_hypes" ON public.hypes
+      FOR ALL TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='hypes' AND policyname='anon_read_hypes') THEN
+    CREATE POLICY "anon_read_hypes" ON public.hypes FOR SELECT TO anon USING (true);
+  END IF;
+END $$;
+
+ALTER TABLE public.items ADD COLUMN IF NOT EXISTS hype_count INT NOT NULL DEFAULT 0;
+ALTER TABLE public.items ADD COLUMN IF NOT EXISTS is_public  BOOLEAN NOT NULL DEFAULT false;
+
+CREATE OR REPLACE FUNCTION public.update_hype_count()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    UPDATE public.items SET hype_count = hype_count + 1, is_public = true WHERE id = NEW.item_id;
+  ELSIF TG_OP = 'DELETE' THEN
+    UPDATE public.items SET hype_count = GREATEST(hype_count - 1, 0) WHERE id = OLD.item_id;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS hype_counter ON public.hypes;
+CREATE TRIGGER hype_counter
+  AFTER INSERT OR DELETE ON public.hypes
+  FOR EACH ROW EXECUTE FUNCTION public.update_hype_count();
+
+CREATE INDEX IF NOT EXISTS items_hype_count_idx
+  ON public.items (hype_count DESC) WHERE is_public = true;
+"""
+
+async def _apply_startup_migrations():
+    """
+    Best-effort: apply the hype tables DDL at startup.
+    Tries the Supabase Management API if SUPABASE_MANAGEMENT_TOKEN is set.
+    Falls back to a clear log message with manual instructions.
+    """
+    mgmt_token = os.environ.get("SUPABASE_MANAGEMENT_TOKEN", "")
+    project_ref = SUPABASE_URL.rstrip("/").split("//")[-1].split(".")[0]
+
+    if mgmt_token:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    f"https://api.supabase.io/v1/projects/{project_ref}/database/query",
+                    headers={
+                        "Authorization": f"Bearer {mgmt_token}",
+                        "Content-Type":  "application/json",
+                    },
+                    json={"query": _HYPE_MIGRATION_SQL},
+                )
+                if resp.status_code in (200, 201):
+                    logger.info("✅  Hype tables migration applied via Management API")
+                    return
+                else:
+                    logger.warning(f"Management API migration failed: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Management API migration error: {e}")
+
+    # Silent probe: check if hypes table already exists
+    try:
+        await supabase.table("hypes").select("item_id").limit(1).execute()
+        logger.info("Hype tables already present — skipping migration.")
+        return
+    except Exception:
+        pass  # table doesn't exist
+
+    logger.warning(
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️  PENDING MIGRATION: Hype & Trending tables are NOT set up yet.\n"
+        "   Trending page will show empty until you apply the migration.\n\n"
+        "   1. Open: https://supabase.com/dashboard/project/"
+        f"{project_ref}/sql/new\n"
+        "   2. Paste & run: backend/scripts/create_hype_tables.sql\n\n"
+        "   — OR — add SUPABASE_MANAGEMENT_TOKEN to backend/.env for\n"
+        "   automatic migration next time the server starts.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global supabase
@@ -213,6 +308,12 @@ async def lifespan(app: FastAPI):
         f.write("- POST /api/auth/register\n- POST /api/auth/login\n"
                 "- POST /api/auth/logout\n- GET /api/auth/me\n- POST /api/auth/refresh\n")
 
+    # Apply pending DDL migrations (best-effort; never crashes the server)
+    try:
+        await _apply_startup_migrations()
+    except Exception as _mig_err:
+        logger.warning(f"Startup migration attempt failed: {_mig_err}")
+
     logger.info("Content Memory API started (Supabase backend)")
     yield
     # supabase-py HTTP client cleans up automatically
@@ -242,6 +343,9 @@ async def health():
 async def register(req: RegisterRequest, response: Response,
                    background_tasks: BackgroundTasks):
     email = req.email.lower().strip()
+    user_id: str = ""
+
+    # ── Attempt 1: Admin API (bypasses email-confirmation flow) ───────────────
     try:
         res = await supabase.auth.admin.create_user({
             "email": email,
@@ -250,11 +354,39 @@ async def register(req: RegisterRequest, response: Response,
             "user_metadata": {"name": req.name},
         })
         user_id = res.user.id
-    except Exception as e:
-        msg = str(e).lower()
-        if any(x in msg for x in ("already registered", "already exists", "unique", "duplicate")):
+    except Exception as admin_err:
+        admin_msg = str(admin_err).lower()
+        if any(x in admin_msg for x in ("already registered", "already exists",
+                                         "unique", "duplicate", "user already")):
             raise HTTPException(status_code=400, detail="Email already registered")
-        raise HTTPException(status_code=400, detail=f"Registration failed: {e}")
+
+        # ── Attempt 2: Standard sign_up (works even when admin API is restricted) ─
+        logger.warning(f"Admin create_user failed ({admin_err}); falling back to sign_up")
+        try:
+            res2 = await supabase.auth.sign_up({
+                "email": email,
+                "password": req.password,
+                "options": {"data": {"name": req.name}},
+            })
+            if not res2.user:
+                raise HTTPException(status_code=400,
+                                    detail="Registration failed: no user returned")
+            user_id = res2.user.id
+            # Immediately confirm the email so the user can log in right away
+            try:
+                await supabase.auth.admin.update_user_by_id(
+                    user_id, {"email_confirm": True}
+                )
+            except Exception:
+                pass  # Email confirmation update failed — user may need to verify email
+        except HTTPException:
+            raise
+        except Exception as e2:
+            msg2 = str(e2).lower()
+            if any(x in msg2 for x in ("already registered", "already exists",
+                                        "unique", "duplicate", "user already")):
+                raise HTTPException(status_code=400, detail="Email already registered")
+            raise HTTPException(status_code=400, detail=f"Registration failed: {e2}")
 
     access_token  = create_access_token(user_id, email)
     refresh_token = create_refresh_token(user_id)
@@ -458,39 +590,85 @@ async def save_url(req: SaveRequest, background_tasks: BackgroundTasks,
 
 # ─── Category → Collection Auto-Assignment ───────────────────────────────────
 CATEGORY_COLLECTION_MAP = {
-    "Fitness & Health":     "Fitness & Health",
-    "Sports":               "Fitness & Health",
-    "Travel":               "Travel",
-    "Nature & Outdoors":    "Travel",
-    "Food & Recipes":       "Food & Recipes",
-    "Technology":           "Technology",
-    "Education & Learning": "Learning",
-    "DIY & Crafts":         "Learning",
-    "Entertainment":        "Entertainment",
-    "Comedy & Humor":       "Entertainment",
-    "Music":                "Entertainment",
-    "Gaming":               "Entertainment",
-    "Art & Creativity":     "Entertainment",
-    "Finance & Money":      "Finance",
-    "Career & Business":    "Finance",
-    "Fashion & Beauty":     "Fashion & Style",
-    "Skincare":             "Fashion & Style",
-    "Shopping":             "Fashion & Style",
-    "Parenting":            "Learning",
-    "Motivation":           "Learning",
-    "Relationships":        "Entertainment",
-    "Pets & Animals":       "Entertainment",
+    # Fitness
+    "Fitness & Health":       "Fitness & Health",
+    "Sports":                 "Fitness & Health",
+    # Travel
+    "Travel":                 "Travel",
+    "Nature & Outdoors":      "Travel",
+    "Home & Interior":        "Travel",   # catch-all for lifestyle
+    # Food
+    "Food & Recipes":         "Food & Recipes",
+    # Tech
+    "Technology":             "Technology",
+    # Learning
+    "Education & Learning":   "Learning",
+    "DIY & Crafts":           "Learning",
+    "Parenting":              "Learning",
+    "Motivation":             "Learning",
+    "News & Current Events":  "Learning",
+    # Entertainment
+    "Entertainment":          "Entertainment",
+    "Comedy & Humor":         "Entertainment",
+    "Music":                  "Entertainment",
+    "Gaming":                 "Entertainment",
+    "Art & Creativity":       "Entertainment",
+    "Relationships":          "Entertainment",
+    "Pets & Animals":         "Entertainment",
+    # Finance
+    "Finance & Money":        "Finance",
+    "Career & Business":      "Finance",
+    # Fashion
+    "Fashion & Beauty":       "Fashion & Style",
+    "Skincare":               "Fashion & Style",
+    "Shopping":               "Fashion & Style",
 }
+
+# Keyword-based fallback: if the exact category key is not in the map,
+# scan the category string for these keywords.
+_KEYWORD_COLLECTION_MAP = [
+    (["travel", "trip", "tour", "destination", "place", "visit", "explore"],        "Travel"),
+    (["food", "recipe", "cook", "eat", "restaurant", "drink", "cuisine", "meal"],   "Food & Recipes"),
+    (["fitness", "workout", "gym", "exercise", "health", "sport", "yoga", "run"],   "Fitness & Health"),
+    (["tech", "software", "app", "code", "program", "ai", "device", "gadget"],      "Technology"),
+    (["finance", "money", "invest", "budget", "crypto", "stock", "earn"],           "Finance"),
+    (["fashion", "style", "outfit", "beauty", "makeup", "skin", "hair"],            "Fashion & Style"),
+    (["learn", "educate", "study", "tutorial", "how-to", "craft", "diy", "tips"],  "Learning"),
+    (["entertain", "music", "comedy", "fun", "game", "art", "movie", "show"],       "Entertainment"),
+]
 
 async def auto_assign_to_collection(item_id: str, user_id: str, ai_result: dict):
     try:
-        target_name = CATEGORY_COLLECTION_MAP.get(ai_result.get("category", ""))
+        category = ai_result.get("category", "")
+        tags     = ai_result.get("tags", [])
+
+        # 1. Exact map lookup
+        target_name = CATEGORY_COLLECTION_MAP.get(category)
+
+        # 2. Keyword fallback using category + sub_category + tags
+        if not target_name:
+            search_text = " ".join(
+                [category, ai_result.get("sub_category", "")] + list(tags)
+            ).lower()
+            for keywords, coll_name in _KEYWORD_COLLECTION_MAP:
+                if any(kw in search_text for kw in keywords):
+                    target_name = coll_name
+                    break
+
         if not target_name:
             return
+
+        # 3. Find the collection (try exact match first, then partial)
         coll = await supabase.table("collections").select("id") \
             .eq("user_id", user_id).ilike("name", target_name).maybe_single().execute()
         if not coll.data:
+            # Partial match — user may have renamed e.g. "Travel Bucket List"
+            coll = await supabase.table("collections").select("id") \
+                .eq("user_id", user_id).ilike("name", f"%{target_name}%").maybe_single().execute()
+        if not coll.data:
+            logger.info(f"No collection found for '{target_name}' (user {user_id})")
             return
+
         collection_id = coll.data["id"]
         existing = await supabase.table("item_collection_map").select("id") \
             .eq("collection_id", collection_id).eq("item_id", item_id).maybe_single().execute()
@@ -501,8 +679,8 @@ async def auto_assign_to_collection(item_id: str, user_id: str, ai_result: dict)
                 "added_at":      datetime.now(timezone.utc).isoformat(),
             }).execute()
             logger.info(f"Auto-assigned item {item_id} to collection '{target_name}'")
-    except Exception:
-        pass  # never crash the pipeline
+    except Exception as e:
+        logger.warning(f"auto_assign_to_collection error: {e}")  # never crash the pipeline
 
 
 # ─── Background Processing Pipeline ──────────────────────────────────────────
@@ -1155,61 +1333,106 @@ async def chat_with_library(
 
 # ── Hype endpoints (Phase 5) ──────────────────────────────────────────────────
 
+def _migration_needed_error():
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Hype tables not set up yet. "
+            "Run scripts/create_hype_tables.sql in the Supabase SQL editor: "
+            "https://supabase.com/dashboard/project/foktswfeqhzpyrbxzrkm/sql/new"
+        ),
+    )
+
+
 @app.post("/api/items/{item_id}/hype")
 async def hype_item(item_id: str, user: dict = Depends(get_current_user)):
     """Add a hype for an item. Idempotent — re-hyping the same item is a no-op."""
-    item_res = await supabase.table("items").select("id, hype_count, user_id") \
-        .eq("id", item_id).maybe_single().execute()
-    if not item_res.data:
-        raise HTTPException(status_code=404, detail="Item not found")
-
     try:
-        await supabase.table("hypes").insert({
-            "item_id": item_id,
-            "user_id": user["id"],
-        }).execute()
-    except Exception as e:
-        if "duplicate" in str(e).lower() or "23505" in str(e):
-            pass  # Already hyped — idempotent
-        else:
-            raise HTTPException(status_code=500, detail=str(e))
+        item_res = await supabase.table("items").select("id, user_id") \
+            .eq("id", item_id).maybe_single().execute()
+        if not item_res.data:
+            raise HTTPException(status_code=404, detail="Item not found")
 
-    updated = await supabase.table("items").select("hype_count") \
-        .eq("id", item_id).maybe_single().execute()
-    hype_count = (updated.data or {}).get("hype_count", 0)
-    return {"item_id": item_id, "hype_count": hype_count, "hyped": True}
+        try:
+            await supabase.table("hypes").insert({
+                "item_id": item_id,
+                "user_id": user["id"],
+            }).execute()
+        except Exception as e:
+            err = str(e).lower()
+            if "duplicate" in err or "23505" in err:
+                pass  # Already hyped — idempotent
+            elif "relation" in err and "hypes" in err:
+                _migration_needed_error()
+            else:
+                raise HTTPException(status_code=500, detail=str(e))
+
+        updated = await supabase.table("items").select("hype_count") \
+            .eq("id", item_id).maybe_single().execute()
+        hype_count = (updated.data or {}).get("hype_count", 0)
+        return {"item_id": item_id, "hype_count": hype_count, "hyped": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        if "hype_count" in str(e) or "is_public" in str(e):
+            _migration_needed_error()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/items/{item_id}/hype")
 async def unhype_item(item_id: str, user: dict = Depends(get_current_user)):
     """Remove a hype (un-hype). Idempotent."""
-    await supabase.table("hypes") \
-        .delete() \
-        .eq("item_id", item_id) \
-        .eq("user_id", user["id"]) \
-        .execute()
-
-    updated = await supabase.table("items").select("hype_count") \
-        .eq("id", item_id).maybe_single().execute()
-    hype_count = (updated.data or {}).get("hype_count", 0)
-    return {"item_id": item_id, "hype_count": hype_count, "hyped": False}
+    try:
+        await supabase.table("hypes") \
+            .delete() \
+            .eq("item_id", item_id) \
+            .eq("user_id", user["id"]) \
+            .execute()
+        updated = await supabase.table("items").select("hype_count") \
+            .eq("id", item_id).maybe_single().execute()
+        hype_count = (updated.data or {}).get("hype_count", 0)
+        return {"item_id": item_id, "hype_count": hype_count, "hyped": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        err = str(e).lower()
+        if ("relation" in err and "hypes" in err) or "hype_count" in err:
+            _migration_needed_error()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/items/{item_id}/hype")
 async def get_hype_status(item_id: str, user: dict = Depends(get_current_user)):
     """Return current hype_count and whether the current user has hyped this item."""
-    item_res = await supabase.table("items").select("hype_count") \
-        .eq("id", item_id).maybe_single().execute()
-    if not item_res.data:
-        raise HTTPException(status_code=404, detail="Item not found")
+    try:
+        item_res = await supabase.table("items").select("id") \
+            .eq("id", item_id).maybe_single().execute()
+        if not item_res.data:
+            raise HTTPException(status_code=404, detail="Item not found")
 
-    hype_res = await supabase.table("hypes").select("item_id") \
-        .eq("item_id", item_id).eq("user_id", user["id"]).limit(1).execute()
-    return {
-        "item_id":    item_id,
-        "hype_count": (item_res.data or {}).get("hype_count", 0),
-        "hyped":      bool(hype_res.data),
-    }
+        # If hypes table doesn't exist yet, return defaults instead of crashing
+        try:
+            hype_res = await supabase.table("hypes").select("item_id") \
+                .eq("item_id", item_id).eq("user_id", user["id"]).limit(1).execute()
+        except Exception:
+            return {"item_id": item_id, "hype_count": 0, "hyped": False}
+
+        try:
+            count_res = await supabase.table("items").select("hype_count") \
+                .eq("id", item_id).maybe_single().execute()
+            hype_count = (count_res.data or {}).get("hype_count", 0)
+        except Exception:
+            hype_count = 0
+
+        return {
+            "item_id":    item_id,
+            "hype_count": hype_count,
+            "hyped":      bool(hype_res.data),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"item_id": item_id, "hype_count": 0, "hyped": False}
 
 
 @app.get("/api/trending")
@@ -1223,41 +1446,63 @@ async def get_trending(
     """Return publicly hyped items sorted by hype_count (cross-user trending feed)."""
     skip = (page - 1) * limit
 
-    query = supabase.table("items") \
-        .select("*, count", count="exact") \
-        .eq("is_public", True) \
-        .gt("hype_count", 0) \
-        .order("hype_count", desc=True)
+    try:
+        query = supabase.table("items") \
+            .select("*, count", count="exact") \
+            .eq("is_public", True) \
+            .gt("hype_count", 0) \
+            .order("hype_count", desc=True)
 
-    if period == "day":
-        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        query = query.gte("updated_at", since)
-    elif period == "week":
-        since = (datetime.now(timezone.utc) - timedelta(weeks=1)).isoformat()
-        query = query.gte("updated_at", since)
+        if period == "day":
+            since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            query = query.gte("updated_at", since)
+        elif period == "week":
+            since = (datetime.now(timezone.utc) - timedelta(weeks=1)).isoformat()
+            query = query.gte("updated_at", since)
 
-    if category:
-        query = query.ilike("category", f"%{category}%")
+        if category:
+            query = query.ilike("category", f"%{category}%")
 
-    res = await query.range(skip, skip + limit - 1).execute()
-    items = res.data or []
-    total = res.count or 0
+        res = await query.range(skip, skip + limit - 1).execute()
+        items = res.data or []
+        total = res.count or 0
 
-    if items:
-        item_ids = [it["id"] for it in items]
-        hype_res = await supabase.table("hypes").select("item_id") \
-            .eq("user_id", user["id"]) \
-            .in_("item_id", item_ids) \
-            .execute()
-        hyped_ids = {h["item_id"] for h in (hype_res.data or [])}
-        for it in items:
-            it["user_hyped"] = it["id"] in hyped_ids
-            it.pop("embedding", None)
-            it.pop("notes", None)
+        if items:
+            item_ids = [it["id"] for it in items]
+            try:
+                hype_res = await supabase.table("hypes").select("item_id") \
+                    .eq("user_id", user["id"]) \
+                    .in_("item_id", item_ids) \
+                    .execute()
+                hyped_ids = {h["item_id"] for h in (hype_res.data or [])}
+            except Exception:
+                hyped_ids = set()
+            for it in items:
+                it["user_hyped"] = it["id"] in hyped_ids
+                it.pop("embedding", None)
+                it.pop("notes", None)
 
-    return {
-        "items": items,
-        "total": total,
-        "page":  page,
-        "pages": (total + limit - 1) // limit if total else 1,
-    }
+        return {
+            "items":             items,
+            "total":             total,
+            "page":              page,
+            "pages":             (total + limit - 1) // limit if total else 1,
+            "migration_pending": False,
+        }
+
+    except Exception as e:
+        err = str(e).lower()
+        if "hype_count" in err or "is_public" in err or "column" in err:
+            # Tables not set up yet — return empty with migration hint
+            return {
+                "items":             [],
+                "total":             0,
+                "page":              1,
+                "pages":             1,
+                "migration_pending": True,
+                "migration_hint":    (
+                    "Run scripts/create_hype_tables.sql in the Supabase SQL editor: "
+                    "https://supabase.com/dashboard/project/foktswfeqhzpyrbxzrkm/sql/new"
+                ),
+            }
+        raise HTTPException(status_code=500, detail=str(e))

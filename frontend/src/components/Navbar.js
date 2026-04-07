@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { Home, Search, FolderOpen, MapPin, Settings, LogOut, Menu, X, Bookmark, MessageSquare, TrendingUp } from 'lucide-react';
-import ChatDrawer from './ChatDrawer';
+import { Home, Search, FolderOpen, MapPin, Settings, LogOut, Menu, X, Bookmark, TrendingUp } from 'lucide-react';
 
 const NAV_ITEMS = [
   { path: '/', label: 'Home', icon: Home },
@@ -17,7 +16,6 @@ export default function Navbar() {
   const { user, logout } = useAuth();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [libChatOpen, setLibChatOpen] = useState(false);
 
   return (
     <header className="bg-page/80 backdrop-blur-xl border-b border-border-default sticky top-0 z-50" data-testid="navbar">
@@ -59,18 +57,6 @@ export default function Navbar() {
           <div className="flex items-center gap-3">
             {user && (
               <span className="hidden sm:block text-sm text-text-secondary">{user.name || user.email}</span>
-            )}
-            {/* Global library chat button */}
-            {user && (
-              <button
-                onClick={() => setLibChatOpen(true)}
-                data-testid="library-chat-button"
-                className="hidden md:flex items-center gap-2 px-3 py-2 rounded-full text-sm text-text-secondary hover:text-brand hover:bg-brand/10 transition-colors"
-                aria-label="Library Chat"
-                title="Chat with your library"
-              >
-                <MessageSquare className="w-4 h-4" />
-              </button>
             )}
             <button
               onClick={logout}
@@ -120,12 +106,6 @@ export default function Navbar() {
         )}
       </div>
 
-      {/* Global library chat drawer */}
-      <ChatDrawer
-        isOpen={libChatOpen}
-        onClose={() => setLibChatOpen(false)}
-        mode="library"
-      />
     </header>
   );
 }

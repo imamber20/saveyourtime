@@ -3,11 +3,11 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { itemsAPI, collectionsAPI, placesAPI, formatApiErrorDetail } from '../services/api';
 import { supabase } from '../services/supabase';
-import ChatDrawer from '../components/ChatDrawer';
+import FloatingChat from '../components/FloatingChat';
 import {
   ArrowLeft, ExternalLink, Edit3, Trash2, RefreshCw, MapPin, Tag,
   Clock, CheckCircle, AlertCircle, FolderPlus, Loader2,
-  List, ChefHat, Footprints, PenLine, Check, X, MessageSquare
+  List, ChefHat, Footprints, PenLine, Check, X
 } from 'lucide-react';
 
 const VIDEO_PLACEHOLDER = 'https://static.prod-images.emergentagent.com/jobs/7ecda9fa-840f-42b6-a697-5367aaabdf99/images/54cc39fbc674b1e47eb9c19e535e10a091317d4c51804e073bbaf99dac7b9666.png';
@@ -25,11 +25,11 @@ export default function ItemDetailPage() {
   const [collections, setCollections] = useState([]);
   const [showCollPicker, setShowCollPicker] = useState(false);
   const [error, setError] = useState('');
+  const [retrying, setRetrying] = useState(false);
   const realtimeChannelRef = useRef(null);
   const [correctingPlaceId, setCorrectingPlaceId] = useState(null);
   const [correctionInput, setCorrectionInput] = useState('');
   const [correctionSaving, setCorrectionSaving] = useState(false);
-  const [chatOpen, setChatOpen] = useState(false);
 
   useEffect(() => {
     fetchItem();
@@ -129,10 +129,15 @@ export default function ItemDetailPage() {
   };
 
   const handleRetry = async () => {
+    setRetrying(true);
     try {
       await itemsAPI.retry(id);
-      fetchItem();
-    } catch {}
+      await fetchItem();
+    } catch {
+      /* ignore */
+    } finally {
+      setRetrying(false);
+    }
   };
 
   const handleAddToCollection = async (collId) => {
@@ -200,11 +205,15 @@ export default function ItemDetailPage() {
         </button>
         <div className="flex items-center gap-2">
           {canRetry && (
-            <button onClick={handleRetry} data-testid="retry-button"
-              className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors"
-              aria-label={`Reload (${MAX_RETRIES - retryCount} retries left)`}
-              title={`Reload & reprocess (${MAX_RETRIES - retryCount} retries left)`}>
-              <RefreshCw className="w-4 h-4 text-text-secondary" />
+            <button
+              onClick={handleRetry}
+              disabled={retrying}
+              data-testid="retry-button"
+              className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors disabled:opacity-50"
+              aria-label={retrying ? 'Retrying…' : `Reload (${MAX_RETRIES - retryCount} left)`}
+              title={`Reload & reprocess (${MAX_RETRIES - retryCount} retries left)`}
+            >
+              <RefreshCw className={`w-4 h-4 text-text-secondary ${retrying ? 'animate-spin' : ''}`} />
             </button>
           )}
           {retriesExhausted && (
@@ -212,10 +221,6 @@ export default function ItemDetailPage() {
               Max retries
             </span>
           )}
-          <button onClick={() => setChatOpen(true)} data-testid="ask-ai-button"
-            className="p-2.5 rounded-full border border-brand/30 bg-brand/5 hover:bg-brand/10 transition-colors" aria-label="Ask AI">
-            <MessageSquare className="w-4 h-4 text-brand" />
-          </button>
           <button onClick={() => setEditing(!editing)} data-testid="edit-button"
             className="p-2.5 rounded-full border border-border-default hover:bg-surface-hover transition-colors" aria-label="Edit">
             <Edit3 className="w-4 h-4 text-text-secondary" />
@@ -558,13 +563,13 @@ export default function ItemDetailPage() {
         </div>
       </div>
 
-      {/* Per-item AI chat drawer */}
-      <ChatDrawer
-        isOpen={chatOpen}
-        onClose={() => setChatOpen(false)}
+      {/* Per-item AI chat — floating button bottom-right */}
+      <FloatingChat
         mode="item"
         itemId={id}
-        itemTitle={item?.title}
+        item={item}
+        offsetRight={24}
+        offsetBottom={24}
       />
     </motion.div>
   );

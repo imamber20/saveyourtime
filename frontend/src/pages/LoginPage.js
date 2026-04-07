@@ -98,24 +98,6 @@ export default function LoginPage() {
           </form>
         </div>
 
-        {/* Demo credentials hint */}
-        <div className="bg-surface-hover border border-border-default rounded-xl p-4 mt-4" data-testid="demo-credentials">
-          <p className="text-xs font-semibold uppercase tracking-wider text-text-secondary mb-2">Demo Credentials</p>
-          <div className="flex items-center justify-between">
-            <div className="text-sm text-text-primary">
-              <span className="text-text-secondary">Email:</span> admin@example.com<br/>
-              <span className="text-text-secondary">Pass:</span> admin123
-            </div>
-            <button
-              type="button"
-              onClick={() => { setEmail('admin@example.com'); setPassword('admin123'); }}
-              data-testid="fill-demo-credentials"
-              className="text-xs text-brand hover:underline font-medium"
-            >
-              Fill
-            </button>
-          </div>
-        </div>
 
         <p className="text-center text-sm text-text-secondary mt-4">
           Don't have an account?{' '}
