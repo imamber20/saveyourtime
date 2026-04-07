@@ -272,21 +272,38 @@ async def lifespan(app: FastAPI):
             existing_admin = next((u for u in all_users if u.email == ADMIN_EMAIL), None)
 
             if existing_admin:
-                # Exists but wrong password — reset it to the configured value
+                # Exists but wrong password — reset it via direct httpx
                 admin_id = existing_admin.id
-                await supabase.auth.admin.update_user_by_id(
-                    admin_id, {"password": ADMIN_PASSWORD}
-                )
+                async with httpx.AsyncClient(timeout=15) as _hc:
+                    await _hc.put(
+                        f"{SUPABASE_URL}/auth/v1/admin/users/{admin_id}",
+                        headers={
+                            "apikey":        SUPABASE_SERVICE_ROLE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                            "Content-Type":  "application/json",
+                        },
+                        json={"password": ADMIN_PASSWORD},
+                    )
                 logger.info(f"Admin password reset to configured value: {ADMIN_EMAIL}")
             else:
-                # Truly new — create from scratch
-                res      = await supabase.auth.admin.create_user({
-                    "email":         ADMIN_EMAIL,
-                    "password":      ADMIN_PASSWORD,
-                    "email_confirm": True,
-                    "user_metadata": {"name": "Admin", "role": "admin"},
-                })
-                admin_id = res.user.id
+                # Truly new — create via direct httpx (supabase-py omits apikey header)
+                async with httpx.AsyncClient(timeout=15) as _hc:
+                    _r = await _hc.post(
+                        f"{SUPABASE_URL}/auth/v1/admin/users",
+                        headers={
+                            "apikey":        SUPABASE_SERVICE_ROLE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                            "Content-Type":  "application/json",
+                        },
+                        json={
+                            "email":         ADMIN_EMAIL,
+                            "password":      ADMIN_PASSWORD,
+                            "email_confirm": True,
+                            "user_metadata": {"name": "Admin", "role": "admin"},
+                        },
+                    )
+                _r.raise_for_status()
+                admin_id = _r.json().get("id")
                 logger.info(f"Admin user created: {ADMIN_EMAIL}")
 
             # Ensure profile has role=admin
@@ -345,15 +362,34 @@ async def register(req: RegisterRequest, response: Response,
     email = req.email.lower().strip()
     user_id: str = ""
 
-    # ── Attempt 1: Admin API (bypasses email-confirmation flow) ───────────────
+    # ── Attempt 1a: Direct httpx call to GoTrue admin endpoint ───────────────
+    # supabase-py sometimes omits the 'apikey' header that GoTrue admin requires;
+    # using httpx directly ensures both required headers are present.
     try:
-        res = await supabase.auth.admin.create_user({
-            "email": email,
-            "password": req.password,
-            "email_confirm": True,
-            "user_metadata": {"name": req.name},
-        })
-        user_id = res.user.id
+        project_ref = SUPABASE_URL.rstrip("/").split("//")[-1].split(".")[0]
+        async with httpx.AsyncClient(timeout=15) as _hc:
+            _r = await _hc.post(
+                f"{SUPABASE_URL}/auth/v1/admin/users",
+                headers={
+                    "apikey":        SUPABASE_SERVICE_ROLE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "email":          email,
+                    "password":       req.password,
+                    "email_confirm":  True,
+                    "user_metadata":  {"name": req.name},
+                },
+            )
+        if _r.status_code in (200, 201):
+            _data   = _r.json()
+            user_id = _data.get("id", "")
+            if not user_id:
+                raise Exception("No user id in response")
+            logger.info(f"User created via direct GoTrue admin: {email}")
+        else:
+            raise Exception(f"GoTrue {_r.status_code}: {_r.text[:200]}")
     except Exception as admin_err:
         admin_msg = str(admin_err).lower()
         if any(x in admin_msg for x in ("already registered", "already exists",
@@ -386,7 +422,51 @@ async def register(req: RegisterRequest, response: Response,
             if any(x in msg2 for x in ("already registered", "already exists",
                                         "unique", "duplicate", "user already")):
                 raise HTTPException(status_code=400, detail="Email already registered")
-            raise HTTPException(status_code=400, detail=f"Registration failed: {e2}")
+
+            # ── Attempt 3: sign_up may have created the user but hit the email
+            #    rate limit before sending the confirmation.  The user row exists
+            #    in auth.users — look it up and confirm via admin API so they can
+            #    log in immediately without needing to click a verification link.
+            if any(x in msg2 for x in ("rate limit", "email rate", "too many")):
+                logger.warning(f"sign_up rate-limited for {email}; trying admin lookup+confirm via httpx")
+                try:
+                    async with httpx.AsyncClient(timeout=15) as _hc:
+                        _list = await _hc.get(
+                            f"{SUPABASE_URL}/auth/v1/admin/users",
+                            headers={
+                                "apikey":        SUPABASE_SERVICE_ROLE_KEY,
+                                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                            },
+                            params={"per_page": 1000},
+                        )
+                    _users = _list.json() if _list.status_code == 200 else {}
+                    _all   = _users.get("users", []) if isinstance(_users, dict) else []
+                    _found = next((u for u in _all if u.get("email") == email), None)
+                    if _found:
+                        user_id = _found["id"]
+                        # Confirm the user so they can log in without clicking a link
+                        async with httpx.AsyncClient(timeout=15) as _hc:
+                            await _hc.put(
+                                f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                                headers={
+                                    "apikey":        SUPABASE_SERVICE_ROLE_KEY,
+                                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                                    "Content-Type":  "application/json",
+                                },
+                                json={"email_confirm": True},
+                            )
+                        logger.info(f"Confirmed rate-limited sign_up user {email} via admin PUT")
+                    else:
+                        raise HTTPException(
+                            status_code=429,
+                            detail="Too many sign-up attempts. Please wait a few minutes and try again."
+                        )
+                except HTTPException:
+                    raise
+                except Exception as e3:
+                    raise HTTPException(status_code=400, detail=f"Registration failed: {e2}")
+            else:
+                raise HTTPException(status_code=400, detail=f"Registration failed: {e2}")
 
     access_token  = create_access_token(user_id, email)
     refresh_token = create_refresh_token(user_id)
