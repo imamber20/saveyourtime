@@ -1,12 +1,88 @@
 import os
 import json
+import asyncio
 import logging
-from typing import Dict, List, Optional
+import random
+import time
+from typing import Awaitable, Callable, Dict, List, Optional, TypeVar
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("content_memory.ai")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+# ─── Reliability helpers ──────────────────────────────────────────────────────
+# Retry wrapper with exponential backoff + jitter. Retries on transient network
+# / rate-limit errors. Non-retryable errors (auth, 4xx) propagate after 1 try.
+_T = TypeVar("_T")
+
+_RETRYABLE_FRAGMENTS = (
+    "rate limit", "rate_limit", "429",
+    "timeout", "timed out",
+    "connection", "reset", "eof",
+    "503", "502", "500", "overloaded",
+    "apiconnection", "apitimeout",
+)
+
+async def _with_retries(
+    fn: Callable[[], Awaitable[_T]],
+    *,
+    label: str,
+    attempts: int = 3,
+    base_delay: float = 0.75,
+) -> Optional[_T]:
+    last_err: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await fn()
+        except Exception as e:
+            last_err = e
+            msg = (str(e) or "").lower()
+            retryable = any(f in msg for f in _RETRYABLE_FRAGMENTS)
+            if not retryable or attempt == attempts:
+                logger.warning(f"{label} failed ({'no retry' if not retryable else 'final attempt'}): {e}")
+                return None
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+            logger.info(f"{label} transient error (attempt {attempt}/{attempts}), retrying in {delay:.1f}s: {e}")
+            await asyncio.sleep(delay)
+    return None  # pragma: no cover
+
+
+# ─── Tiny circuit breaker around OpenAI ───────────────────────────────────────
+# If OpenAI has 5 consecutive failures in 60s, stop calling it for 2 minutes
+# and return None immediately. This prevents pile-ups when the provider is down.
+class _CircuitBreaker:
+    def __init__(self, name: str, fail_threshold: int = 5, recovery_sec: float = 120):
+        self.name = name
+        self.fail_threshold = fail_threshold
+        self.recovery_sec = recovery_sec
+        self._fails = 0
+        self._open_until = 0.0
+
+    def allow(self) -> bool:
+        if self._open_until and time.monotonic() < self._open_until:
+            return False
+        if self._open_until and time.monotonic() >= self._open_until:
+            logger.info(f"Circuit breaker {self.name}: half-open, allowing probe")
+            self._open_until = 0
+            self._fails = 0
+        return True
+
+    def record_success(self):
+        self._fails = 0
+
+    def record_failure(self):
+        self._fails += 1
+        if self._fails >= self.fail_threshold:
+            self._open_until = time.monotonic() + self.recovery_sec
+            logger.warning(f"Circuit breaker {self.name} OPEN for {self.recovery_sec}s after {self._fails} consecutive failures")
+
+_openai_breaker = _CircuitBreaker("openai")
+
+
+# ─── In-memory cache for embeddings (dedup identical texts) ───────────────────
+_embedding_cache: dict = {}
+_EMBEDDING_CACHE_MAX = 500
 
 PREDEFINED_CATEGORIES = [
     "Travel", "Food & Recipes", "Fitness & Health", "Finance & Money",
@@ -63,19 +139,26 @@ async def analyze_thumbnails_with_vision(thumbnail_urls: List[str]) -> str:
     if len(content) == 1:  # no valid image URLs
         return ""
 
-    try:
+    if not _openai_breaker.allow():
+        logger.warning("Vision analysis skipped — OpenAI circuit breaker open")
+        return ""
+
+    async def _call():
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": content}],
             max_tokens=600,
             temperature=0.2,
         )
-        result = response.choices[0].message.content or ""
-        logger.info(f"Vision analysis: {len(result)} chars extracted")
-        return result
-    except Exception as e:
-        logger.warning(f"Vision analysis failed: {e}")
+        return response.choices[0].message.content or ""
+
+    result = await _with_retries(_call, label="vision_analysis")
+    if result is None:
+        _openai_breaker.record_failure()
         return ""
+    _openai_breaker.record_success()
+    logger.info(f"Vision analysis: {len(result)} chars extracted")
+    return result
 
 
 # ─── Audio Transcription ──────────────────────────────────────────────────────
@@ -99,19 +182,38 @@ async def transcribe_audio(audio_path: str) -> str:
 
 # ─── Embeddings ───────────────────────────────────────────────────────────────
 async def generate_embedding(text: str) -> Optional[List[float]]:
-    """Generate embedding using OpenAI text-embedding-3-small."""
+    """Generate embedding using OpenAI text-embedding-3-small.
+    Retries on transient failures; caches repeated identical inputs."""
     client = get_openai_client()
     if not client or not text.strip():
         return None
-    try:
+
+    cache_key = text[:8000]
+    cached = _embedding_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not _openai_breaker.allow():
+        logger.warning("Embedding skipped — OpenAI circuit breaker open")
+        return None
+
+    async def _call():
         response = await client.embeddings.create(
             model="text-embedding-3-small",
-            input=text[:8000]
+            input=cache_key,
         )
         return response.data[0].embedding
-    except Exception as e:
-        logger.error(f"Embedding generation failed: {e}")
+
+    embedding = await _with_retries(_call, label="embedding")
+    if embedding is None:
+        _openai_breaker.record_failure()
         return None
+    _openai_breaker.record_success()
+    # Bounded cache — evict randomly when full
+    if len(_embedding_cache) >= _EMBEDDING_CACHE_MAX:
+        _embedding_cache.pop(next(iter(_embedding_cache)))
+    _embedding_cache[cache_key] = embedding
+    return embedding
 
 
 # ─── Main Categorization ──────────────────────────────────────────────────────
@@ -128,8 +230,13 @@ async def categorize_content(metadata: Dict) -> Dict:
         logger.warning("No OpenAI API key set — using fallback categorization")
         return fallback
 
-    try:
-        prompt = _build_categorization_prompt(metadata)
+    if not _openai_breaker.allow():
+        logger.warning("Categorization skipped — OpenAI circuit breaker open")
+        return fallback
+
+    prompt = _build_categorization_prompt(metadata)
+
+    async def _call():
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -147,12 +254,14 @@ async def categorize_content(metadata: Dict) -> Dict:
             max_tokens=1200,
             response_format={"type": "json_object"}
         )
-        result_text = response.choices[0].message.content
-        return _parse_ai_response(result_text, metadata)
+        return response.choices[0].message.content
 
-    except Exception as e:
-        logger.error(f"AI categorization failed: {e}")
+    result_text = await _with_retries(_call, label="categorization", attempts=3)
+    if not result_text:
+        _openai_breaker.record_failure()
         return fallback
+    _openai_breaker.record_success()
+    return _parse_ai_response(result_text, metadata)
 
 
 def _build_categorization_prompt(metadata: Dict) -> str:

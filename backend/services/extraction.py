@@ -1,6 +1,9 @@
 import re
+import asyncio
 import base64
 import logging
+import random
+import time
 import httpx
 from bs4 import BeautifulSoup
 from typing import Optional, Dict, List
@@ -12,6 +15,28 @@ import tempfile
 import shutil
 
 logger = logging.getLogger("content_memory.extraction")
+
+# ─── Metadata cache: dedupes repeat saves and makes retries near-instant ─────
+# url → (expires_at_monotonic, metadata_dict). 30-minute TTL.
+_metadata_cache: dict = {}
+_METADATA_TTL_SEC = 30 * 60
+_METADATA_CACHE_MAX = 500
+
+def _cache_get(url: str) -> Optional[Dict]:
+    row = _metadata_cache.get(url)
+    if not row:
+        return None
+    expires, data = row
+    if time.monotonic() > expires:
+        _metadata_cache.pop(url, None)
+        return None
+    return data
+
+def _cache_put(url: str, data: Dict):
+    if len(_metadata_cache) >= _METADATA_CACHE_MAX:
+        # Drop one random entry to stay bounded
+        _metadata_cache.pop(next(iter(_metadata_cache)), None)
+    _metadata_cache[url] = (time.monotonic() + _METADATA_TTL_SEC, data)
 
 
 class ContentUnavailableError(Exception):
@@ -163,6 +188,12 @@ async def _http_page_check(url: str) -> dict:
 
 
 async def extract_metadata(url: str, platform: str) -> Dict:
+    # Hot path: return cached metadata when the same URL is retried within TTL.
+    cached = _cache_get(url)
+    if cached:
+        logger.info(f"Metadata cache hit for {url}")
+        return cached
+
     metadata = {
         "title": "",
         "description": "",
@@ -175,11 +206,19 @@ async def extract_metadata(url: str, platform: str) -> Dict:
         "duration": "",
     }
 
-    # Try yt-dlp first for ALL platforms — it supports YouTube, Instagram, Facebook
-    try:
-        metadata = await _extract_ytdlp_metadata(url, metadata)
-    except Exception as e:
-        logger.warning(f"yt-dlp extraction failed for {url}: {e}")
+    # Try yt-dlp first with retries on transient failures (network, rate limits)
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        try:
+            metadata = await _extract_ytdlp_metadata(url, metadata)
+            if metadata.get("title") or metadata.get("description") or metadata.get("thumbnail_url"):
+                break
+        except ContentUnavailableError:
+            raise  # final — content is gone, don't retry
+        except Exception as e:
+            logger.warning(f"yt-dlp extraction failed (attempt {attempt}/{attempts}) for {url}: {e}")
+            if attempt < attempts:
+                await asyncio.sleep(0.5 * attempt + random.uniform(0, 0.3))
 
     # Fall back to OpenGraph if yt-dlp got nothing useful
     if not metadata.get("title") and not metadata.get("description"):
@@ -189,6 +228,10 @@ async def extract_metadata(url: str, platform: str) -> Dict:
             raise  # propagate — page confirmed content is gone
         except Exception as e:
             logger.warning(f"OpenGraph fallback also failed for {url}: {e}")
+
+    # Cache only successful extracts (skip caching dead links)
+    if metadata.get("title") or metadata.get("description") or metadata.get("thumbnail_url"):
+        _cache_put(url, metadata)
 
     return metadata
 

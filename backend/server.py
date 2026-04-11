@@ -11,6 +11,9 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
+import hashlib
+import hmac
+import time
 import jwt as pyjwt
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, Depends, BackgroundTasks, Query
@@ -28,6 +31,157 @@ from services.geocoding import geocode_place
 
 MAX_RETRIES = 3
 
+# ─── Rate limiter (in-process, per key+window) ───────────────────────────────
+# Sliding window counters keyed by "<scope>:<ident>". Good enough for single-instance.
+# For multi-instance you swap this out for a Redis INCR+EXPIRE; call sites stay the same.
+_rate_buckets: dict = {}
+
+def _client_ip(request) -> str:
+    # Trust X-Forwarded-For only when RUNNING behind a known proxy (configurable)
+    if os.environ.get("TRUST_PROXY", "0") == "1":
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def _enforce_rate_limit(scope: str, ident: str, *, limit: int, window_sec: int):
+    """Raise 429 if `ident` has exceeded `limit` hits in the last `window_sec`."""
+    if not ident:
+        ident = "anon"
+    now = time.monotonic()
+    key = f"{scope}:{ident}"
+    hits = _rate_buckets.get(key) or []
+    # Drop expired timestamps
+    cutoff = now - window_sec
+    hits = [t for t in hits if t > cutoff]
+    if len(hits) >= limit:
+        # Deterministic retry-after so clients can back off cleanly
+        oldest = min(hits)
+        retry_after = max(1, int(window_sec - (now - oldest)))
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please slow down.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    hits.append(now)
+    _rate_buckets[key] = hits
+    # Periodic GC so the dict doesn't grow forever
+    if len(_rate_buckets) > 5000:
+        _rate_buckets.clear()
+
+# ─── LLM guardrails (off-topic / prompt-injection filters) ───────────────────
+# Block obvious attempts to misuse the chatbot as a general-purpose LLM or
+# extract the system prompt. This is a soft filter — the real defense is the
+# system prompt in chat_service.py, which constrains the model to the user's
+# saved content. These patterns short-circuit abusive calls before we spend
+# tokens on them.
+_MAX_CHAT_MESSAGES = 30
+_MAX_MESSAGE_CHARS = 4000
+
+_ABUSE_PATTERNS = [
+    # Prompt exfiltration / jailbreaks
+    r"\bignore (all |the )?(previous|prior|above) (instructions|prompt|rules)\b",
+    r"\b(system|developer) prompt\b",
+    r"\bprint (your|the) (system|initial) prompt\b",
+    r"\byou are (now )?(dan|jailbroken|in developer mode)\b",
+    r"\boverride (your|all) (safety|guardrails|rules)\b",
+    # Off-topic / policy
+    r"\bhow (do|to) (make|build|create) (a )?(bomb|explosive|weapon|gun|malware|virus|ransomware)\b",
+    r"\bchild (porn|sex)",
+    r"\bsuicide (method|instructions)\b",
+]
+_ABUSE_RE = re.compile("|".join(_ABUSE_PATTERNS), re.IGNORECASE)
+
+def _guard_chat_messages(messages):
+    """Validate chat input shape and filter obvious abuse. Raises HTTPException on reject."""
+    if not messages:
+        raise HTTPException(status_code=400, detail="No messages provided")
+    if len(messages) > _MAX_CHAT_MESSAGES:
+        raise HTTPException(status_code=400, detail="Conversation too long — start a new chat")
+    for m in messages:
+        role = getattr(m, "role", None) if not isinstance(m, dict) else m.get("role")
+        content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
+        if role not in ("user", "assistant", "system"):
+            raise HTTPException(status_code=400, detail=f"Invalid role: {role!r}")
+        if not isinstance(content, str):
+            raise HTTPException(status_code=400, detail="Message content must be a string")
+        if len(content) > _MAX_MESSAGE_CHARS:
+            raise HTTPException(status_code=400, detail="Message too long")
+        # Only scan user input for abuse (assistant replies may legitimately echo quoted text)
+        if role == "user" and _ABUSE_RE.search(content):
+            raise HTTPException(
+                status_code=400,
+                detail="This request is outside the scope of this assistant. "
+                       "Ask a question about your saved content instead.",
+            )
+
+
+# ─── Stuck-job sweeper (durability for processing_jobs) ─────────────────────
+# FastAPI BackgroundTasks are lost if the process dies. The `processing_jobs`
+# table is the source of truth — this sweeper:
+#   1. Re-queues jobs stuck in `running` for longer than STUCK_THRESHOLD_SEC
+#   2. Picks up any `pending` jobs on startup (crash recovery)
+# It's intentionally conservative: re-queueing is safe because process_item
+# is idempotent (it overwrites item fields, deletes places before re-inserting).
+STUCK_THRESHOLD_SEC = 600     # 10 minutes
+SWEEPER_INTERVAL_SEC = 120    # every 2 minutes
+
+async def _stuck_job_sweeper():
+    await asyncio.sleep(5)  # let app finish starting
+    logger.info("Stuck-job sweeper started")
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff = (now - timedelta(seconds=STUCK_THRESHOLD_SEC)).isoformat()
+
+            # Find stuck/pending jobs whose items are still flagged for processing
+            res = await supabase.table("processing_jobs") \
+                .select("item_id, status, started_at") \
+                .in_("status", ["pending", "running"]) \
+                .lt("started_at", cutoff) \
+                .limit(20).execute()
+
+            for job in (res.data or []):
+                item_id = job["item_id"]
+                # Re-fetch the item to get url/platform/user_id
+                item_res = await supabase.table("items").select("id, url, platform, user_id, retry_count") \
+                    .eq("id", item_id).limit(1).execute()
+                item = _first(item_res)
+                if not item:
+                    continue
+                retry_count = item.get("retry_count") or 0
+                if retry_count >= MAX_RETRIES:
+                    # Already tried enough — mark failed so UI can show a retry button
+                    await supabase.table("processing_jobs").update({
+                        "status": "failed",
+                        "error_message": "Exceeded retries after stuck detection",
+                        "completed_at": now.isoformat(),
+                    }).eq("item_id", item_id).execute()
+                    await supabase.table("items").update({
+                        "source_status": "failed",
+                        "updated_at":    now.isoformat(),
+                    }).eq("id", item_id).execute()
+                    continue
+                logger.warning(f"Resuming stuck job for item {item_id} (retry {retry_count+1}/{MAX_RETRIES})")
+                await supabase.table("items").update({
+                    "retry_count": retry_count + 1,
+                    "updated_at":  now.isoformat(),
+                }).eq("id", item_id).execute()
+                await supabase.table("processing_jobs").update({
+                    "status": "pending",
+                    "step_name": "metadata_extraction",
+                    "error_message": "",
+                    "started_at": now.isoformat(),
+                    "completed_at": None,
+                }).eq("item_id", item_id).execute()
+                # Kick off in a task so we don't block the sweeper loop
+                asyncio.create_task(process_item(item_id, item["url"], item["platform"], item["user_id"]))
+        except Exception as e:
+            logger.warning(f"Sweeper iteration error: {e}")
+
+        await asyncio.sleep(SWEEPER_INTERVAL_SEC)
+
+
 # ─── Supabase helper ─────────────────────────────────────────────────────────
 def _first(res) -> Optional[dict]:
     """Return the first row from a supabase query result as a plain dict, or None.
@@ -42,15 +196,70 @@ def _first(res) -> Optional[dict]:
     return data[0] if isinstance(data, list) else data
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-SUPABASE_URL             = os.environ["SUPABASE_URL"]
+# Environment mode — "development" enables relaxed cookies for localhost dev.
+# Anything else (e.g. "production", "staging") enforces Secure/SameSite=strict cookies.
+APP_ENV = os.environ.get("APP_ENV", "development").lower().strip()
+IS_PROD = APP_ENV not in ("development", "dev", "local", "test")
+
+SUPABASE_URL              = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-JWT_SECRET               = os.environ["JWT_SECRET"]   # signs our own session tokens
-JWT_ALGORITHM            = "HS256"
-ADMIN_EMAIL              = os.environ.get("ADMIN_EMAIL", "admin@example.com").lower().strip()
-ADMIN_PASSWORD           = os.environ.get("ADMIN_PASSWORD", "admin123")
+JWT_SECRET                = os.environ["JWT_SECRET"]   # signs our own session tokens
+JWT_ALGORITHM             = "HS256"
+
+# Admin seed is OPT-IN only: both env vars must be set, with no defaults.
+# In production the server refuses to start with weak/missing JWT_SECRET.
+ADMIN_EMAIL    = (os.environ.get("ADMIN_EMAIL") or "").lower().strip() or None
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or None
+
+# Cookie policy — secure by default in production, relaxed for localhost dev.
+COOKIE_SECURE   = os.environ.get("COOKIE_SECURE", "1" if IS_PROD else "0") == "1"
+COOKIE_SAMESITE = os.environ.get("COOKIE_SAMESITE", "strict" if IS_PROD else "lax").lower()
+COOKIE_DOMAIN   = os.environ.get("COOKIE_DOMAIN") or None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("content_memory")
+
+# ─── Fail-fast config validation ─────────────────────────────────────────────
+_WEAK_SECRETS = {
+    "", "dev", "test", "secret", "change-me", "changeme", "password",
+    "your-secret-here", "your-jwt-secret-here", "jwt-secret", "default",
+}
+
+def _validate_config():
+    """Abort startup on insecure config. Called before the app can accept requests."""
+    problems: List[str] = []
+
+    if not JWT_SECRET or JWT_SECRET.lower().strip() in _WEAK_SECRETS:
+        problems.append("JWT_SECRET is missing or uses a known-weak value")
+    if IS_PROD and len(JWT_SECRET) < 32:
+        problems.append("JWT_SECRET must be ≥32 chars in production (use `openssl rand -hex 32`)")
+
+    if IS_PROD and not COOKIE_SECURE:
+        problems.append("COOKIE_SECURE must be enabled in production (set COOKIE_SECURE=1)")
+    if IS_PROD and COOKIE_SAMESITE not in ("strict", "lax", "none"):
+        problems.append(f"Invalid COOKIE_SAMESITE: {COOKIE_SAMESITE!r}")
+
+    frontend_url = os.environ.get("FRONTEND_URL", "")
+    if IS_PROD and (not frontend_url or frontend_url.startswith("http://localhost")):
+        problems.append("FRONTEND_URL must be an https URL in production")
+
+    # Admin seed must be all-or-nothing; never allow half-configured
+    if (ADMIN_EMAIL and not ADMIN_PASSWORD) or (ADMIN_PASSWORD and not ADMIN_EMAIL):
+        problems.append("ADMIN_EMAIL and ADMIN_PASSWORD must be set together, or not at all")
+    if IS_PROD and ADMIN_PASSWORD and len(ADMIN_PASSWORD) < 12:
+        problems.append("ADMIN_PASSWORD must be ≥12 chars in production")
+
+    if problems:
+        for p in problems:
+            logger.error(f"[config] {p}")
+        raise RuntimeError(
+            "Refusing to start with insecure config. "
+            "Fix the issues above in backend/.env then restart."
+        )
+
+    logger.info(f"Config OK (APP_ENV={APP_ENV}, cookie_secure={COOKIE_SECURE}, samesite={COOKIE_SAMESITE})")
+
+_validate_config()
 
 # ─── Supabase async client (initialised in lifespan) ─────────────────────────
 supabase: AsyncClient = None   # type: ignore[assignment]
@@ -73,9 +282,27 @@ def create_refresh_token(user_id: str) -> str:
     }
     return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+def _cookie_kwargs(max_age: int) -> dict:
+    """Shared cookie policy — Secure/HttpOnly/SameSite driven by APP_ENV."""
+    kwargs = {
+        "httponly": True,
+        "secure":   COOKIE_SECURE,
+        "samesite": COOKIE_SAMESITE,
+        "max_age":  max_age,
+        "path":     "/",
+    }
+    if COOKIE_DOMAIN:
+        kwargs["domain"] = COOKIE_DOMAIN
+    return kwargs
+
 def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
-    response.set_cookie("access_token",  access_token,  httponly=True, secure=False, samesite="lax", max_age=3600,   path="/")
-    response.set_cookie("refresh_token", refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    response.set_cookie("access_token",  access_token,  **_cookie_kwargs(3600))
+    response.set_cookie("refresh_token", refresh_token, **_cookie_kwargs(604800))
+
+def clear_auth_cookies(response: Response):
+    # Delete with matching domain/path so browsers actually remove them
+    response.delete_cookie("access_token",  path="/", domain=COOKIE_DOMAIN)
+    response.delete_cookie("refresh_token", path="/", domain=COOKIE_DOMAIN)
 
 
 # ─── Auth dependency ──────────────────────────────────────────────────────────
@@ -136,8 +363,51 @@ class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
 
-# In-memory password-reset tokens (no DB needed for this local app)
+# ─── Password reset token store ──────────────────────────────────────────────
+# Tokens are HASHED before storage (never keep plaintext). Single-use, TTL-bound.
+# The raw token is returned exactly once from forgot-password and never logged.
+#
+# Stored form: { token_hash: { user_id, expires_at, used } }
+# In-memory single-process for now; can be swapped for a Supabase table without
+# changing any call sites because all access goes through _put_reset / _use_reset.
 _reset_tokens: dict = {}
+_RESET_TTL_MINUTES = 30
+
+def _hash_reset_token(raw: str) -> str:
+    # Keyed HMAC so a DB dump alone can't be brute-forced into raw tokens
+    return hmac.new(JWT_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+
+def _put_reset_token(user_id: str) -> str:
+    # 32 bytes of entropy, urlsafe base64 → unguessable in ~10^77 attempts
+    raw = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    # Prune expired entries opportunistically (keeps dict bounded)
+    _purge_expired_reset_tokens(now)
+    _reset_tokens[_hash_reset_token(raw)] = {
+        "user_id":    user_id,
+        "expires_at": now + timedelta(minutes=_RESET_TTL_MINUTES),
+        "used":       False,
+    }
+    return raw
+
+def _purge_expired_reset_tokens(now: datetime):
+    stale = [k for k, v in _reset_tokens.items() if v["expires_at"] < now or v["used"]]
+    for k in stale:
+        _reset_tokens.pop(k, None)
+
+def _use_reset_token(raw: str) -> Optional[str]:
+    """Validate and burn a reset token. Returns the user_id or None."""
+    if not raw or len(raw) < 20:
+        return None
+    h = _hash_reset_token(raw)
+    rec = _reset_tokens.get(h)
+    if not rec:
+        return None
+    if rec["used"] or rec["expires_at"] < datetime.now(timezone.utc):
+        _reset_tokens.pop(h, None)
+        return None
+    rec["used"] = True  # single-use
+    return rec["user_id"]
 
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
@@ -263,30 +533,41 @@ async def _apply_startup_migrations():
     )
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global supabase
-    supabase = await acreate_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    logger.info("Supabase client initialised")
+async def _seed_admin_if_configured():
+    """
+    Seed/verify the admin account ONLY when both ADMIN_EMAIL and ADMIN_PASSWORD
+    are explicitly set in the environment. No default admin is ever created.
+    In production this is an operator-controlled bootstrap — omit the vars to skip.
+    """
+    if not (ADMIN_EMAIL and ADMIN_PASSWORD):
+        logger.info("Admin seed skipped (ADMIN_EMAIL/ADMIN_PASSWORD not set) — no default admin created.")
+        return
 
-    # Seed / verify admin user
-    admin_id = None
     try:
-        # Happy path: admin exists with the correct password
-        res      = await supabase.auth.sign_in_with_password(
+        res = await supabase.auth.sign_in_with_password(
             {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
         )
         admin_id = res.user.id
         logger.info(f"Admin login OK: {ADMIN_EMAIL}")
     except Exception:
-        # Either doesn't exist OR password is stale (e.g. after migration with temp pw)
+        admin_id = None
         try:
-            all_users      = await supabase.auth.admin.list_users()
-            existing_admin = next((u for u in all_users if u.email == ADMIN_EMAIL), None)
+            async with httpx.AsyncClient(timeout=15) as _hc:
+                _list = await _hc.get(
+                    f"{SUPABASE_URL}/auth/v1/admin/users",
+                    headers={
+                        "apikey":        SUPABASE_SERVICE_ROLE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    },
+                    params={"per_page": 1000},
+                )
+            existing = None
+            if _list.status_code == 200:
+                users = _list.json().get("users", [])
+                existing = next((u for u in users if u.get("email") == ADMIN_EMAIL), None)
 
-            if existing_admin:
-                # Exists but wrong password — reset it via direct httpx
-                admin_id = existing_admin.id
+            if existing:
+                admin_id = existing["id"]
                 async with httpx.AsyncClient(timeout=15) as _hc:
                     await _hc.put(
                         f"{SUPABASE_URL}/auth/v1/admin/users/{admin_id}",
@@ -299,7 +580,6 @@ async def lifespan(app: FastAPI):
                     )
                 logger.info(f"Admin password reset to configured value: {ADMIN_EMAIL}")
             else:
-                # Truly new — create via direct httpx (supabase-py omits apikey header)
                 async with httpx.AsyncClient(timeout=15) as _hc:
                     _r = await _hc.post(
                         f"{SUPABASE_URL}/auth/v1/admin/users",
@@ -319,24 +599,21 @@ async def lifespan(app: FastAPI):
                 admin_id = _r.json().get("id")
                 logger.info(f"Admin user created: {ADMIN_EMAIL}")
 
-            # Ensure profile has role=admin
-            await supabase.table("profiles").update({"role": "admin", "name": "Admin"}) \
-                .eq("id", admin_id).execute()
-            await seed_default_collections(admin_id)
+            if admin_id:
+                await supabase.table("profiles").update({"role": "admin", "name": "Admin"}) \
+                    .eq("id", admin_id).execute()
+                await seed_default_collections(admin_id)
         except Exception as err:
-            logger.warning(f"Admin seeding skipped: {err}")
+            logger.warning(f"Admin seeding failed (non-fatal): {err}")
 
-    # Write test credentials to memory dir
-    memory_dir = os.environ.get(
-        "MEMORY_DIR", os.path.join(os.path.dirname(__file__), "..", "memory")
-    )
-    os.makedirs(memory_dir, exist_ok=True)
-    with open(os.path.join(memory_dir, "test_credentials.md"), "w") as f:
-        f.write("# Test Credentials\n\n")
-        f.write(f"## Admin\n- Email: {ADMIN_EMAIL}\n- Password: {ADMIN_PASSWORD}\n- Role: admin\n\n")
-        f.write("## Auth Endpoints\n")
-        f.write("- POST /api/auth/register\n- POST /api/auth/login\n"
-                "- POST /api/auth/logout\n- GET /api/auth/me\n- POST /api/auth/refresh\n")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global supabase
+    supabase = await acreate_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    logger.info("Supabase client initialised")
+
+    await _seed_admin_if_configured()
 
     # Apply pending DDL migrations (best-effort; never crashes the server)
     try:
@@ -344,7 +621,13 @@ async def lifespan(app: FastAPI):
     except Exception as _mig_err:
         logger.warning(f"Startup migration attempt failed: {_mig_err}")
 
-    logger.info("Content Memory API started (Supabase backend)")
+    # Kick off background workers (stuck-job sweeper; processing loop is still inline via BackgroundTasks)
+    try:
+        asyncio.create_task(_stuck_job_sweeper())
+    except Exception as _w_err:
+        logger.warning(f"Background sweeper failed to start: {_w_err}")
+
+    logger.info(f"Content Memory API started (APP_ENV={APP_ENV})")
     yield
     # supabase-py HTTP client cleans up automatically
 
@@ -370,9 +653,15 @@ async def health():
 
 # ─── Auth Routes ──────────────────────────────────────────────────────────────
 @app.post("/api/auth/register")
-async def register(req: RegisterRequest, response: Response,
+async def register(req: RegisterRequest, request: Request, response: Response,
                    background_tasks: BackgroundTasks):
+    ip = _client_ip(request)
+    _enforce_rate_limit("register", ip, limit=5, window_sec=3600)
     email = req.email.lower().strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email")
+    if not req.password or len(req.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
     user_id: str = ""
 
     # ── Attempt 1a: Direct httpx call to GoTrue admin endpoint ───────────────
@@ -489,8 +778,12 @@ async def register(req: RegisterRequest, response: Response,
 
 
 @app.post("/api/auth/login")
-async def login(req: LoginRequest, response: Response):
+async def login(req: LoginRequest, request: Request, response: Response):
+    ip = _client_ip(request)
     email = req.email.lower().strip()
+    # Two-dimensional rate limit: stop credential-stuffing per-IP AND per-email
+    _enforce_rate_limit("login_ip",    ip,    limit=20, window_sec=900)
+    _enforce_rate_limit("login_email", email, limit=10, window_sec=900)
     try:
         res  = await supabase.auth.sign_in_with_password(
             {"email": email, "password": req.password}
@@ -518,8 +811,7 @@ async def login(req: LoginRequest, response: Response):
 
 @app.post("/api/auth/logout")
 async def logout(response: Response):
-    response.delete_cookie("access_token",  path="/")
-    response.delete_cookie("refresh_token", path="/")
+    clear_auth_cookies(response)
     return {"message": "Logged out"}
 
 
@@ -551,18 +843,21 @@ async def refresh_token_endpoint(request: Request, response: Response):
         except Exception:
             raise HTTPException(status_code=401, detail="User not found")
         new_access = create_access_token(user_id, email)
-        response.set_cookie("access_token", new_access, httponly=True,
-                            secure=False, samesite="lax", max_age=3600, path="/")
+        response.set_cookie("access_token", new_access, **_cookie_kwargs(3600))
         return {"message": "Token refreshed"}
     except pyjwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 
 @app.post("/api/auth/forgot-password")
-async def forgot_password(req: ForgotPasswordRequest):
+async def forgot_password(req: ForgotPasswordRequest, request: Request):
+    _enforce_rate_limit("forgot", _client_ip(request), limit=5, window_sec=900)
     email = req.email.lower().strip()
-    # Look up user
-    user_id = None
+
+    # Always return the same opaque response so attackers can't enumerate accounts
+    generic_response = {"message": "If the email exists, a reset link has been sent."}
+
+    user_id: Optional[str] = None
     try:
         page = await supabase.auth.admin.list_users()
         for u in page:
@@ -573,29 +868,40 @@ async def forgot_password(req: ForgotPasswordRequest):
         pass
 
     if not user_id:
-        return {"message": "If the email exists, a reset link has been sent."}
+        return generic_response
 
-    token = secrets.token_urlsafe(32)
-    _reset_tokens[token] = {
-        "user_id": user_id,
-        "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
-    }
-    logger.info(f"Password reset token for {email}: {token}")
-    return {"message": "If the email exists, a reset link has been sent."}
+    raw_token = _put_reset_token(user_id)
+
+    # In dev we expose the token in the response so the local frontend can complete the flow
+    # without a mail server. In production the token should only reach the user via email.
+    if IS_PROD:
+        # Dispatch email here (hook up SES/Resend/SendGrid). Never log raw tokens.
+        logger.info(f"Password reset requested for user_id={user_id[:8]}… (token not logged)")
+        return generic_response
+    else:
+        logger.info(f"[dev] Password reset requested for {email}. Token returned in response body.")
+        return {**generic_response, "debug_token": raw_token}
 
 
 @app.post("/api/auth/reset-password")
-async def reset_password(req: ResetPasswordRequest):
-    record = _reset_tokens.get(req.token)
-    if not record or record["expires_at"] < datetime.now(timezone.utc):
+async def reset_password(req: ResetPasswordRequest, request: Request):
+    _enforce_rate_limit("reset", _client_ip(request), limit=10, window_sec=900)
+
+    if not req.new_password or len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    user_id = _use_reset_token(req.token)
+    if not user_id:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
+
     try:
         await supabase.auth.admin.update_user_by_id(
-            record["user_id"], {"password": req.new_password}
+            user_id, {"password": req.new_password}
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Password reset failed: {e}")
-    _reset_tokens.pop(req.token, None)
+        # Don't echo raw error (may contain internal identifiers)
+        logger.warning(f"Password reset apply failed for user_id={user_id[:8]}…: {e}")
+        raise HTTPException(status_code=400, detail="Password reset failed")
     return {"message": "Password reset successfully"}
 
 
@@ -609,8 +915,11 @@ async def check_url_endpoint(url: str, user: dict = Depends(get_current_user)):
 
 # ─── Save Flow ────────────────────────────────────────────────────────────────
 @app.post("/api/save")
-async def save_url(req: SaveRequest, background_tasks: BackgroundTasks,
+async def save_url(req: SaveRequest, request: Request, background_tasks: BackgroundTasks,
                    user: dict = Depends(get_current_user)):
+    # Abuse control — limit saves per user and per IP independently
+    _enforce_rate_limit("save_user", user["id"],          limit=60, window_sec=3600)
+    _enforce_rate_limit("save_ip",   _client_ip(request), limit=120, window_sec=3600)
     url = req.url.strip()
     if not validate_url(url):
         raise HTTPException(status_code=400, detail="Invalid URL")
@@ -817,33 +1126,47 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
                 f"No content extracted from {url} — post may be deleted, private, or login-gated"
             )
 
-        # ── Step 2: Vision analysis ───────────────────────────────────────────
+        # ── Step 2+3: Vision analysis AND audio transcript run in parallel ────
+        # Both are IO-heavy (network + OpenAI), no dependency on each other.
+        # This typically halves time-to-AI-step.
+        await update_job({"step_name": "vision_and_transcript"})
+
         visual_text = ""
         thumb_urls  = metadata.get("thumbnail_urls", [])
         if not thumb_urls and metadata.get("thumbnail_url"):
             thumb_urls = [metadata["thumbnail_url"]]
 
-        if thumb_urls:
+        async def _run_vision():
+            if not thumb_urls:
+                return ""
             try:
-                await update_job({"step_name": "vision_analysis"})
                 from services.ai_service import analyze_thumbnails_with_vision
-                visual_text = await analyze_thumbnails_with_vision(thumb_urls)
-                if visual_text:
-                    metadata["visual_text"] = visual_text
-                    logger.info(f"Vision done for {item_id}: {len(visual_text)} chars")
+                return await asyncio.wait_for(
+                    analyze_thumbnails_with_vision(thumb_urls), timeout=45
+                )
             except Exception as e:
                 logger.warning(f"Vision skipped for {item_id}: {e}")
+                return ""
 
-        # ── Step 3: Audio transcript ──────────────────────────────────────────
-        try:
-            from services.extraction import extract_transcript_from_video
-            await update_job({"step_name": "transcript_extraction"})
-            transcript = await extract_transcript_from_video(url, platform)
-            if transcript:
-                metadata["transcript"] = transcript
-                logger.info(f"Transcript for {item_id}: {len(transcript)} chars")
-        except Exception as e:
-            logger.warning(f"Transcript skipped for {item_id}: {e}")
+        async def _run_transcript():
+            try:
+                from services.extraction import extract_transcript_from_video
+                return await asyncio.wait_for(
+                    extract_transcript_from_video(url, platform), timeout=120
+                )
+            except Exception as e:
+                logger.warning(f"Transcript skipped for {item_id}: {e}")
+                return None
+
+        visual_text, transcript = await asyncio.gather(
+            _run_vision(), _run_transcript(), return_exceptions=False
+        )
+        if visual_text:
+            metadata["visual_text"] = visual_text
+            logger.info(f"Vision done for {item_id}: {len(visual_text)} chars")
+        if transcript:
+            metadata["transcript"] = transcript
+            logger.info(f"Transcript for {item_id}: {len(transcript)} chars")
 
         # ── Step 4: AI categorisation ─────────────────────────────────────────
         await update_job({"step_name": "ai_categorization"})
@@ -980,31 +1303,34 @@ async def list_items(
 
 @app.get("/api/items/{item_id}")
 async def get_item(item_id: str, user: dict = Depends(get_current_user)):
-    res = await supabase.table("items").select("*") \
+    # Fan out all side-fetches in parallel instead of sequential waterfalls
+    item_task   = supabase.table("items").select("*") \
         .eq("id", item_id).eq("user_id", user["id"]).limit(1).execute()
-    item = _first(res)
+    places_task = supabase.table("places").select("*").eq("item_id", item_id).execute()
+    map_task    = supabase.table("item_collection_map").select("collection_id") \
+        .eq("item_id", item_id).execute()
+    job_task    = supabase.table("processing_jobs").select("*") \
+        .eq("item_id", item_id).limit(1).execute()
+
+    item_res, places_res, map_res, job_res = await asyncio.gather(
+        item_task, places_task, map_task, job_task
+    )
+
+    item = _first(item_res)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    # Places
-    places_res      = await supabase.table("places").select("*").eq("item_id", item_id).execute()
-    item["places"]  = places_res.data or []
+    item["places"] = places_res.data or []
 
-    # Collections this item belongs to
-    map_res = await supabase.table("item_collection_map").select("collection_id") \
-        .eq("item_id", item_id).execute()
-    collections = []
-    for m in (map_res.data or []):
-        cr = await supabase.table("collections").select("*") \
-            .eq("id", m["collection_id"]).limit(1).execute()
-        _cr = _first(cr)
-        if _cr:
-            collections.append(_cr)
-    item["collections"] = collections
+    # Batch-fetch all collections this item belongs to (one query, not N)
+    collection_ids = [m["collection_id"] for m in (map_res.data or [])]
+    if collection_ids:
+        coll_res = await supabase.table("collections").select("*") \
+            .in_("id", collection_ids).execute()
+        item["collections"] = coll_res.data or []
+    else:
+        item["collections"] = []
 
-    # Processing job
-    job_res = await supabase.table("processing_jobs").select("*") \
-        .eq("item_id", item_id).limit(1).execute()
     _job = _first(job_res)
     if _job:
         item["processing"] = _job
@@ -1068,12 +1394,19 @@ async def create_collection(req: CreateCollectionRequest,
 async def list_collections(user: dict = Depends(get_current_user)):
     res = await supabase.table("collections").select("*") \
         .eq("user_id", user["id"]).order("created_at", desc=True).execute()
-    collections = []
-    for coll in (res.data or []):
-        cnt = await supabase.table("item_collection_map").select("*", count="exact") \
-            .eq("collection_id", coll["id"]).execute()
-        coll["item_count"] = cnt.count or 0
-        collections.append(coll)
+    collections = res.data or []
+    if not collections:
+        return {"collections": []}
+
+    # One query to count all items across all collections, then tally in Python
+    coll_ids = [c["id"] for c in collections]
+    map_res  = await supabase.table("item_collection_map").select("collection_id") \
+        .in_("collection_id", coll_ids).execute()
+    counts: dict = {}
+    for row in (map_res.data or []):
+        counts[row["collection_id"]] = counts.get(row["collection_id"], 0) + 1
+    for c in collections:
+        c["item_count"] = counts.get(c["id"], 0)
     return {"collections": collections}
 
 
@@ -1087,13 +1420,16 @@ async def get_collection(collection_id: str, user: dict = Depends(get_current_us
 
     map_res = await supabase.table("item_collection_map").select("item_id") \
         .eq("collection_id", collection_id).execute()
-    items = []
-    for m in (map_res.data or []):
-        ir = await supabase.table("items").select("*") \
-            .eq("id", m["item_id"]).limit(1).execute()
-        _ir = _first(ir)
-        if _ir:
-            items.append(_ir)
+    item_ids = [m["item_id"] for m in (map_res.data or [])]
+
+    if item_ids:
+        # Batch-fetch all items in one query (replaces N queries in a loop)
+        items_res = await supabase.table("items").select("*") \
+            .in_("id", item_ids).execute()
+        items = items_res.data or []
+    else:
+        items = []
+
     coll["items"]      = items
     coll["item_count"] = len(items)
     return coll
@@ -1240,13 +1576,24 @@ async def get_map_items(
         .eq("user_id", user["id"]).eq("is_place_related", True)
     if category:
         query = query.eq("category", category)
-    items_res  = await query.execute()
+    items_res = await query.execute()
+    items = items_res.data or []
+    if not items:
+        return {"items": []}
 
-    map_items  = []
-    for item in (items_res.data or []):
-        places_res = await supabase.table("places").select("*").eq("item_id", item["id"]).execute()
-        if places_res.data:
-            item["places"] = places_res.data
+    # One query to fetch ALL places, then group by item_id in Python
+    item_ids  = [it["id"] for it in items]
+    places_res = await supabase.table("places").select("*") \
+        .in_("item_id", item_ids).execute()
+    places_by_item: dict = {}
+    for p in (places_res.data or []):
+        places_by_item.setdefault(p["item_id"], []).append(p)
+
+    map_items = []
+    for item in items:
+        places = places_by_item.get(item["id"])
+        if places:
+            item["places"] = places
             map_items.append(item)
     return {"items": map_items}
 
@@ -1262,8 +1609,9 @@ async def get_categories(user: dict = Depends(get_current_user)):
 
 # ─── Retry Processing ─────────────────────────────────────────────────────────
 @app.post("/api/items/{item_id}/retry")
-async def retry_processing(item_id: str, background_tasks: BackgroundTasks,
+async def retry_processing(item_id: str, request: Request, background_tasks: BackgroundTasks,
                            user: dict = Depends(get_current_user)):
+    _enforce_rate_limit("retry_user", user["id"], limit=20, window_sec=3600)
     res = await supabase.table("items").select("*") \
         .eq("id", item_id).eq("user_id", user["id"]).limit(1).execute()
     item = _first(res)
@@ -1399,9 +1747,13 @@ class ChatRequest(BaseModel):
 async def chat_with_item(
     item_id: str,
     body: ChatRequest,
+    request: Request,
     user: dict = Depends(get_current_user),
 ):
     """Stream a per-item chat response grounded in the saved item's content."""
+    _enforce_rate_limit("chat_user", user["id"], limit=60, window_sec=3600)
+    _guard_chat_messages(body.messages)
+
     # Fetch item (verifies ownership)
     item_res = await supabase.table("items").select("*") \
         .eq("id", item_id).eq("user_id", user["id"]).limit(1).execute()
@@ -1433,9 +1785,12 @@ async def chat_with_item(
 @app.post("/api/chat/library")
 async def chat_with_library(
     body: ChatRequest,
+    request: Request,
     user: dict = Depends(get_current_user),
 ):
     """Stream a library-wide chat response using semantic search across all saved items."""
+    _enforce_rate_limit("chat_user", user["id"], limit=60, window_sec=3600)
+    _guard_chat_messages(body.messages)
     messages = [{"role": m.role, "content": m.content} for m in body.messages]
 
     from services.chat_service import library_chat
