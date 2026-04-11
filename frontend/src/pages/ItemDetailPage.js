@@ -503,11 +503,6 @@ export default function ItemDetailPage() {
                           >
                             <PenLine className="w-3.5 h-3.5" />
                           </button>
-                          {place.geocode_source && (
-                            <span className="text-[10px] text-text-secondary opacity-60">
-                              via {place.geocode_source}
-                            </span>
-                          )}
                         </div>
 
                         {/* Inline correction input */}

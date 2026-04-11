@@ -195,11 +195,17 @@ async def extract_metadata(url: str, platform: str) -> Dict:
 
 async def _extract_ytdlp_metadata(url: str, metadata: Dict) -> Dict:
     """Use yt-dlp to extract metadata for YouTube, Instagram, and Facebook."""
-    try:
-        result = subprocess.run(
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        return subprocess.run(
             [YTDLP_PATH, "--dump-json", "--no-download", "--no-playlist", url],
             capture_output=True, text=True, timeout=45
         )
+
+    try:
+        result = await loop.run_in_executor(None, _run)
         # Check for unavailable content before anything else
         combined_output = (result.stdout + result.stderr).lower()
         if result.returncode != 0 and any(p in combined_output for p in _UNAVAILABLE_PATTERNS):
@@ -320,18 +326,23 @@ async def extract_opengraph_metadata(url: str, metadata: Dict) -> Dict:
 # ─── Audio Transcript Extraction ─────────────────────────────────────────────
 async def extract_transcript_from_video(url: str, platform: str) -> Optional[str]:
     """Download audio and transcribe using OpenAI Whisper. Works for all platforms."""
+    import asyncio
+    loop = asyncio.get_event_loop()
     temp_dir = tempfile.mkdtemp(prefix="content_memory_")
     try:
         audio_path = os.path.join(temp_dir, "audio.mp3")
 
-        result = subprocess.run(
-            [YTDLP_PATH, "-x", "--audio-format", "mp3",
-             "--audio-quality", "5",          # smaller file = faster
-             "--max-filesize", "50m",          # cap at 50MB
-             "-o", audio_path,
-             "--no-playlist", url],
-            capture_output=True, text=True, timeout=90
-        )
+        def _run_audio():
+            return subprocess.run(
+                [YTDLP_PATH, "-x", "--audio-format", "mp3",
+                 "--audio-quality", "5",          # smaller file = faster
+                 "--max-filesize", "50m",          # cap at 50MB
+                 "-o", audio_path,
+                 "--no-playlist", url],
+                capture_output=True, text=True, timeout=90
+            )
+
+        result = await loop.run_in_executor(None, _run_audio)
         if result.returncode != 0:
             logger.warning(f"Audio extraction failed ({platform}): {result.stderr[:300]}")
             return None

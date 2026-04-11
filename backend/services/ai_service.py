@@ -183,26 +183,60 @@ Available categories: {categories_str}
 Return ONLY this exact JSON structure (all fields required):
 {{
   "title": "Clean, descriptive title (max 100 chars)",
-  "summary": "Detailed paragraph (4-6 sentences) covering what this video is about, who it's for, and the main value it provides. Be specific — mention actual tips, places, dishes, or products if present.",
-  "key_points": ["Specific actionable point 1", "Specific point 2", "Specific point 3", "Specific point 4", "Specific point 5"],
+  "summary": "Detailed paragraph (4-6 sentences) covering what this video is about, who it's for, and the main value it provides. Be specific — mention actual tips, places, dishes, or products.",
+  "key_points": ["point 1", "point 2", ...],
   "category": "One category from the list above",
   "sub_category": "More specific sub-category",
   "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"],
+  "content_type": "listicle | recipe | travel | tutorial | workout | product_review | general",
   "is_place_related": true or false,
-  "places": ["Place Name, City, Country (e.g. QLA, New Delhi, India)", "Place Name 2, City, Country"],
-  "steps": ["Step 1: ...", "Step 2: ..."],
-  "ingredients": ["ingredient with quantity 1", "ingredient 2"],
+  "places": ["Place Name, City, Country", "Place 2, City, Country"],
+  "steps": ["Step 1 instruction", "Step 2 instruction", ...],
+  "ingredients": ["ingredient with quantity 1", "ingredient 2", ...],
   "transcript_excerpt": "Most informative 2-3 sentences from the transcript (empty string if no transcript)",
   "confidence_score": 0.0 to 1.0
 }}
 
-Rules:
-- key_points: always 3-7 specific bullet points about the ACTUAL content (not generic filler)
-- steps: fill only if the video shows a how-to, recipe, tutorial, or workout routine; otherwise []
-- ingredients: fill only if the video shows food, recipes, or products; otherwise []
-- places: real, specific location names with city and country appended for accurate geocoding (e.g. "QLA, New Delhi, India" or "Eiffel Tower, Paris, France"). Never just a bare venue name — always include city/country context.
-- summary: must be detailed and specific, NOT generic. If it's a recipe, name the dish. If travel, name the destination. If fitness, name the workout.
-- transcript_excerpt: pick the most informative / dense part of the transcript"""
+CRITICAL CONTENT-TYPE EXTRACTION RULES — read carefully:
+
+1. LISTICLES ("Top 5 X", "5 things to buy", "Best 10 Y", "N places to visit"):
+   - Identify the exact number mentioned (5, 10, etc.)
+   - Extract EVERY single item mentioned by name into `key_points` — one item per entry
+   - Each key_point must be the full specific name (e.g. "Kinoko Hostel, Canggu" not just "a hostel")
+   - If the listicle mentions PRODUCTS: list them in `ingredients` too (ingredients = "things/articles")
+   - If it mentions PLACES (travel, restaurants, hotels, bars): list them in `places` AND `key_points`
+   - NEVER summarise a listicle into 3 generic points — preserve the full list
+
+2. RECIPES / COOKING ("how to make X", food prep, cooking shorts):
+   - `ingredients`: every ingredient with quantity if mentioned (e.g. "2 cups flour", "1 tsp salt")
+   - `steps`: full step-by-step instructions in chronological order, each step a clear action
+   - `key_points`: 3-5 highlights (e.g. "Total time: 15 min", "Makes 4 servings", "Key technique: ...")
+
+3. TRAVEL / PLACES ("visit Bali", "hidden spots in Tokyo", city guides):
+   - `places`: EVERY specific location with full "Name, City, Country" context for geocoding
+   - `key_points`: one per place with a short reason to visit
+   - Never use bare venue names — always append city and country
+
+4. TUTORIALS / HOW-TO (fitness routines, DIY, tech tips):
+   - `steps`: detailed numbered steps in order
+   - `key_points`: main takeaways or tips
+   - `ingredients`: tools/equipment needed (if applicable)
+
+5. PRODUCT REVIEWS / SHOPPING HAULS:
+   - `ingredients`: list of products reviewed with brand names
+   - `key_points`: verdict/pros for each product
+
+6. GENERAL / MOTIVATIONAL / COMEDY:
+   - `key_points`: 3-5 main takeaways
+   - steps, ingredients, places: empty arrays []
+
+EXTRACTION FIDELITY RULES:
+- If the creator says "here are 5 hostels", you MUST return 5 items — not 3, not generic summaries
+- Extract ACTUAL names mentioned in title/description/transcript/visual_text
+- key_points must reference real things from the video, never generic filler like "great tips" or "useful advice"
+- Places always include city + country (e.g. "Eiffel Tower, Paris, France")
+- summary must mention actual dish names, place names, product names — NEVER be generic
+- content_type helps the UI decide which section to emphasise"""
 
 
 def _make_fallback(metadata: Dict) -> Dict:
@@ -246,14 +280,15 @@ def _parse_ai_response(response: str, metadata: Dict) -> Dict:
         validated = {
             "title": str(result.get("title", fallback["title"]))[:200],
             "summary": str(result.get("summary", fallback["summary"]))[:1500],
-            "key_points": _str_list(result.get("key_points"), max_items=10, max_len=300),
+            "key_points": _str_list(result.get("key_points"), max_items=15, max_len=300),
             "category": str(result.get("category", "Other")),
             "sub_category": str(result.get("sub_category", "")),
             "tags": _str_list(result.get("tags"), max_items=10, max_len=50),
+            "content_type": str(result.get("content_type", "general"))[:30],
             "is_place_related": bool(result.get("is_place_related", False)),
-            "places": _str_list(result.get("places"), max_items=5, max_len=100),
-            "steps": _str_list(result.get("steps"), max_items=20, max_len=400),
-            "ingredients": _str_list(result.get("ingredients"), max_items=30, max_len=200),
+            "places": _str_list(result.get("places"), max_items=15, max_len=120),
+            "steps": _str_list(result.get("steps"), max_items=25, max_len=400),
+            "ingredients": _str_list(result.get("ingredients"), max_items=40, max_len=200),
             "transcript_excerpt": str(result.get("transcript_excerpt", ""))[:500],
             "confidence_score": min(max(float(result.get("confidence_score", 0.5)), 0.0), 1.0)
         }

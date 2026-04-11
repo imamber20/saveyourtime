@@ -28,6 +28,19 @@ from services.geocoding import geocode_place
 
 MAX_RETRIES = 3
 
+# ─── Supabase helper ─────────────────────────────────────────────────────────
+def _first(res) -> Optional[dict]:
+    """Return the first row from a supabase query result as a plain dict, or None.
+    Handles the supabase-py v2 bug where maybe_single().execute() returns None
+    instead of a response object when no rows are found.
+    Use with .limit(1).execute() — never .limit(1).execute()."""
+    if res is None:
+        return None
+    data = res.data if hasattr(res, "data") else res
+    if not data:
+        return None
+    return data[0] if isinstance(data, list) else data
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 SUPABASE_URL             = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -145,7 +158,7 @@ async def seed_default_collections(user_id: str):
     for coll in DEFAULT_COLLECTIONS:
         existing = await supabase.table("collections").select("id") \
             .eq("user_id", user_id).eq("name", coll["name"]) \
-            .maybe_single().execute()
+            .limit(1).execute()
         if not existing.data:
             await supabase.table("collections").insert({
                 "user_id": user_id,
@@ -492,10 +505,10 @@ async def login(req: LoginRequest, response: Response):
 
     # Fetch role from profiles table
     prof = await supabase.table("profiles").select("role, name") \
-        .eq("id", user_id).maybe_single().execute()
-    role = (prof.data or {}).get("role", "user")
+        .eq("id", user_id).limit(1).execute()
+    role = (_first(prof) or {}).get("role", "user")
     if not name:
-        name = (prof.data or {}).get("name", "")
+        name = (_first(prof) or {}).get("name", "")
 
     access_token  = create_access_token(user_id, email)
     refresh_token = create_refresh_token(user_id)
@@ -513,10 +526,11 @@ async def logout(response: Response):
 @app.get("/api/auth/me")
 async def me(user: dict = Depends(get_current_user)):
     prof = await supabase.table("profiles").select("name, role") \
-        .eq("id", user["id"]).maybe_single().execute()
-    if prof.data:
-        user["name"] = prof.data.get("name", "")
-        user["role"] = prof.data.get("role", "user")
+        .eq("id", user["id"]).limit(1).execute()
+    _p = _first(prof)
+    if _p:
+        user["name"] = _p.get("name", "")
+        user["role"] = _p.get("role", "user")
     return user
 
 
@@ -608,20 +622,25 @@ async def save_url(req: SaveRequest, background_tasks: BackgroundTasks,
             detail="Unsupported platform. Only Instagram Reels, YouTube Shorts, and Facebook Reels are supported.",
         )
 
-    # Fast availability pre-check
+    # Pre-save availability check — confirms the post still exists so we can
+    # morph the checking tile into the animated 404 "content gone" card and
+    # auto-expire it instead of writing a dead row to the library.
     check = await quick_availability_check(url)
-    if not check["available"] and check.get("reason") != "timeout":
+    if not check.get("available", True):
         raise HTTPException(
-            status_code=422,
-            detail={"type": "unavailable",
-                    "reason": check["reason"] or "Content not found or no longer accessible"},
+            status_code=404,
+            detail={
+                "type": "unavailable",
+                "reason": check.get("reason", "Content no longer available"),
+            },
         )
 
     # Duplicate check
     dup = await supabase.table("items").select("id") \
-        .eq("url", url).eq("user_id", user["id"]).maybe_single().execute()
-    if dup.data:
-        return {"item_id": dup.data["id"], "status": "duplicate",
+        .eq("url", url).eq("user_id", user["id"]).limit(1).execute()
+    _dup = _first(dup)
+    if _dup:
+        return {"item_id": _dup["id"], "status": "duplicate",
                 "message": "This URL has already been saved."}
 
     now = datetime.now(timezone.utc).isoformat()
@@ -740,18 +759,20 @@ async def auto_assign_to_collection(item_id: str, user_id: str, ai_result: dict)
 
         # 3. Find the collection (try exact match first, then partial)
         coll = await supabase.table("collections").select("id") \
-            .eq("user_id", user_id).ilike("name", target_name).maybe_single().execute()
-        if not coll.data:
+            .eq("user_id", user_id).ilike("name", target_name).limit(1).execute()
+        _coll = _first(coll)
+        if not _coll:
             # Partial match — user may have renamed e.g. "Travel Bucket List"
             coll = await supabase.table("collections").select("id") \
-                .eq("user_id", user_id).ilike("name", f"%{target_name}%").maybe_single().execute()
-        if not coll.data:
+                .eq("user_id", user_id).ilike("name", f"%{target_name}%").limit(1).execute()
+            _coll = _first(coll)
+        if not _coll:
             logger.info(f"No collection found for '{target_name}' (user {user_id})")
             return
 
-        collection_id = coll.data["id"]
+        collection_id = _coll["id"]
         existing = await supabase.table("item_collection_map").select("id") \
-            .eq("collection_id", collection_id).eq("item_id", item_id).maybe_single().execute()
+            .eq("collection_id", collection_id).eq("item_id", item_id).limit(1).execute()
         if not existing.data:
             await supabase.table("item_collection_map").insert({
                 "collection_id": collection_id,
@@ -841,6 +862,7 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
             "visual_text":        (visual_text[:500] if visual_text else ""),
             "category":           ai_result.get("category", "Other"),
             "sub_category":       ai_result.get("sub_category", ""),
+            "content_type":       ai_result.get("content_type", "general"),
             "tags":               ai_result.get("tags", []),
             "is_place_related":   ai_result.get("is_place_related", False),
             "confidence_score":   ai_result.get("confidence_score", 0.5),
@@ -866,6 +888,13 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
             logger.warning(f"Embedding generation skipped for {item_id}: {e}")
 
         # ── Step 5: Geocoding ─────────────────────────────────────────────────
+        # Clear any previously-geocoded places for this item so retries don't
+        # produce duplicates (e.g. the same hostel inserted twice on re-processing).
+        try:
+            await supabase.table("places").delete().eq("item_id", item_id).execute()
+        except Exception as e:
+            logger.warning(f"Could not clear existing places for {item_id}: {e}")
+
         if ai_result.get("is_place_related") and ai_result.get("places"):
             await update_job({"step_name": "geocoding"})
             # Build context hint for disambiguation (e.g. "Kyoto travel reel")
@@ -875,7 +904,13 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
                 ai_result.get("sub_category", ""),
             ]))[:120]
 
-            for place_entry in ai_result["places"][:5]:
+            # Deduplicate place entries (case-insensitive) within a single run
+            seen_places = set()
+            for place_entry in ai_result["places"][:15]:
+                key = place_entry.strip().lower()
+                if key in seen_places:
+                    continue
+                seen_places.add(key)
                 display_name = (
                     place_entry.split(",")[0].strip() if "," in place_entry else place_entry
                 )
@@ -946,10 +981,10 @@ async def list_items(
 @app.get("/api/items/{item_id}")
 async def get_item(item_id: str, user: dict = Depends(get_current_user)):
     res = await supabase.table("items").select("*") \
-        .eq("id", item_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not res.data:
+        .eq("id", item_id).eq("user_id", user["id"]).limit(1).execute()
+    item = _first(res)
+    if not item:
         raise HTTPException(status_code=404, detail="Item not found")
-    item = res.data
 
     # Places
     places_res      = await supabase.table("places").select("*").eq("item_id", item_id).execute()
@@ -961,16 +996,18 @@ async def get_item(item_id: str, user: dict = Depends(get_current_user)):
     collections = []
     for m in (map_res.data or []):
         cr = await supabase.table("collections").select("*") \
-            .eq("id", m["collection_id"]).maybe_single().execute()
-        if cr.data:
-            collections.append(cr.data)
+            .eq("id", m["collection_id"]).limit(1).execute()
+        _cr = _first(cr)
+        if _cr:
+            collections.append(_cr)
     item["collections"] = collections
 
     # Processing job
     job_res = await supabase.table("processing_jobs").select("*") \
-        .eq("item_id", item_id).maybe_single().execute()
-    if job_res.data:
-        item["processing"] = job_res.data
+        .eq("item_id", item_id).limit(1).execute()
+    _job = _first(job_res)
+    if _job:
+        item["processing"] = _job
 
     return item
 
@@ -979,8 +1016,8 @@ async def get_item(item_id: str, user: dict = Depends(get_current_user)):
 async def update_item(item_id: str, req: UpdateItemRequest,
                       user: dict = Depends(get_current_user)):
     chk = await supabase.table("items").select("id") \
-        .eq("id", item_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not chk.data:
+        .eq("id", item_id).eq("user_id", user["id"]).limit(1).execute()
+    if not _first(chk):
         raise HTTPException(status_code=404, detail="Item not found")
 
     fields: dict = {"updated_at": datetime.now(timezone.utc).isoformat()}
@@ -1001,8 +1038,8 @@ async def update_item(item_id: str, req: UpdateItemRequest,
 @app.delete("/api/items/{item_id}")
 async def delete_item(item_id: str, user: dict = Depends(get_current_user)):
     chk = await supabase.table("items").select("id") \
-        .eq("id", item_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not chk.data:
+        .eq("id", item_id).eq("user_id", user["id"]).limit(1).execute()
+    if not _first(chk):
         raise HTTPException(status_code=404, detail="Item not found")
 
     await supabase.table("places").delete().eq("item_id", item_id).execute()
@@ -1043,19 +1080,20 @@ async def list_collections(user: dict = Depends(get_current_user)):
 @app.get("/api/collections/{collection_id}")
 async def get_collection(collection_id: str, user: dict = Depends(get_current_user)):
     res = await supabase.table("collections").select("*") \
-        .eq("id", collection_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not res.data:
+        .eq("id", collection_id).eq("user_id", user["id"]).limit(1).execute()
+    coll = _first(res)
+    if not coll:
         raise HTTPException(status_code=404, detail="Collection not found")
-    coll = res.data
 
     map_res = await supabase.table("item_collection_map").select("item_id") \
         .eq("collection_id", collection_id).execute()
     items = []
     for m in (map_res.data or []):
         ir = await supabase.table("items").select("*") \
-            .eq("id", m["item_id"]).maybe_single().execute()
-        if ir.data:
-            items.append(ir.data)
+            .eq("id", m["item_id"]).limit(1).execute()
+        _ir = _first(ir)
+        if _ir:
+            items.append(_ir)
     coll["items"]      = items
     coll["item_count"] = len(items)
     return coll
@@ -1065,8 +1103,8 @@ async def get_collection(collection_id: str, user: dict = Depends(get_current_us
 async def update_collection(collection_id: str, req: CreateCollectionRequest,
                             user: dict = Depends(get_current_user)):
     chk = await supabase.table("collections").select("id") \
-        .eq("id", collection_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not chk.data:
+        .eq("id", collection_id).eq("user_id", user["id"]).limit(1).execute()
+    if not _first(chk):
         raise HTTPException(status_code=404, detail="Collection not found")
     updated = await supabase.table("collections").update({
         "name":        req.name,
@@ -1079,8 +1117,8 @@ async def update_collection(collection_id: str, req: CreateCollectionRequest,
 @app.delete("/api/collections/{collection_id}")
 async def delete_collection(collection_id: str, user: dict = Depends(get_current_user)):
     chk = await supabase.table("collections").select("id") \
-        .eq("id", collection_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not chk.data:
+        .eq("id", collection_id).eq("user_id", user["id"]).limit(1).execute()
+    if not _first(chk):
         raise HTTPException(status_code=404, detail="Collection not found")
     await supabase.table("item_collection_map").delete().eq("collection_id", collection_id).execute()
     await supabase.table("collections").delete().eq("id", collection_id).execute()
@@ -1090,8 +1128,9 @@ async def delete_collection(collection_id: str, user: dict = Depends(get_current
 @app.get("/api/collections/{collection_id}/available-items")
 async def get_available_items(collection_id: str, user: dict = Depends(get_current_user)):
     res = await supabase.table("collections").select("id, name") \
-        .eq("id", collection_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not res.data:
+        .eq("id", collection_id).eq("user_id", user["id"]).limit(1).execute()
+    _res = _first(res)
+    if not _res:
         raise HTTPException(status_code=404, detail="Collection not found")
 
     map_res  = await supabase.table("item_collection_map").select("item_id") \
@@ -1105,23 +1144,23 @@ async def get_available_items(collection_id: str, user: dict = Depends(get_curre
     for item in (items_res.data or []):
         item["in_collection"] = item["id"] in in_coll
         items.append(item)
-    return {"items": items, "collection_name": res.data["name"]}
+    return {"items": items, "collection_name": _res["name"]}
 
 
 @app.post("/api/collections/{collection_id}/items")
 async def add_item_to_collection(collection_id: str, req: AddItemToCollectionRequest,
                                  user: dict = Depends(get_current_user)):
     coll_chk = await supabase.table("collections").select("id") \
-        .eq("id", collection_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not coll_chk.data:
+        .eq("id", collection_id).eq("user_id", user["id"]).limit(1).execute()
+    if not _first(coll_chk):
         raise HTTPException(status_code=404, detail="Collection not found")
     item_chk = await supabase.table("items").select("id") \
-        .eq("id", req.item_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not item_chk.data:
+        .eq("id", req.item_id).eq("user_id", user["id"]).limit(1).execute()
+    if not _first(item_chk):
         raise HTTPException(status_code=404, detail="Item not found")
     existing = await supabase.table("item_collection_map").select("id") \
-        .eq("collection_id", collection_id).eq("item_id", req.item_id).maybe_single().execute()
-    if existing.data:
+        .eq("collection_id", collection_id).eq("item_id", req.item_id).limit(1).execute()
+    if _first(existing):
         return {"message": "Item already in collection"}
     await supabase.table("item_collection_map").insert({
         "collection_id": collection_id,
@@ -1135,8 +1174,8 @@ async def add_item_to_collection(collection_id: str, req: AddItemToCollectionReq
 async def remove_item_from_collection(collection_id: str, item_id: str,
                                       user: dict = Depends(get_current_user)):
     coll_chk = await supabase.table("collections").select("id") \
-        .eq("id", collection_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not coll_chk.data:
+        .eq("id", collection_id).eq("user_id", user["id"]).limit(1).execute()
+    if not _first(coll_chk):
         raise HTTPException(status_code=404, detail="Collection not found")
     await supabase.table("item_collection_map").delete() \
         .eq("collection_id", collection_id).eq("item_id", item_id).execute()
@@ -1226,10 +1265,10 @@ async def get_categories(user: dict = Depends(get_current_user)):
 async def retry_processing(item_id: str, background_tasks: BackgroundTasks,
                            user: dict = Depends(get_current_user)):
     res = await supabase.table("items").select("*") \
-        .eq("id", item_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not res.data:
+        .eq("id", item_id).eq("user_id", user["id"]).limit(1).execute()
+    item = _first(res)
+    if not item:
         raise HTTPException(status_code=404, detail="Item not found")
-    item = res.data
 
     retry_count = item.get("retry_count", 0)
     if retry_count >= MAX_RETRIES:
@@ -1263,12 +1302,12 @@ async def retry_processing(item_id: str, background_tasks: BackgroundTasks,
 
     # Upsert the processing job
     job_res = await supabase.table("processing_jobs").select("id") \
-        .eq("item_id", item_id).maybe_single().execute()
+        .eq("item_id", item_id).limit(1).execute()
     job_fields = {
         "status": "pending", "step_name": "metadata_extraction",
         "error_message": "", "started_at": now_str, "completed_at": None,
     }
-    if job_res.data:
+    if _first(job_res):
         await supabase.table("processing_jobs").update(job_fields).eq("item_id", item_id).execute()
     else:
         await supabase.table("processing_jobs").insert(
@@ -1305,11 +1344,11 @@ async def correct_place(
 
     # Verify ownership: the place must belong to one of this user's items
     place_res = await supabase.table("places").select("*, items(user_id)") \
-        .eq("id", place_id).maybe_single().execute()
-    if not place_res.data:
+        .eq("id", place_id).limit(1).execute()
+    place = _first(place_res)
+    if not place:
         raise HTTPException(status_code=404, detail="Place not found")
 
-    place = place_res.data
     owner_id = (place.get("items") or {}).get("user_id")
     if owner_id != user["id"]:
         raise HTTPException(status_code=403, detail="Not your place")
@@ -1365,14 +1404,15 @@ async def chat_with_item(
     """Stream a per-item chat response grounded in the saved item's content."""
     # Fetch item (verifies ownership)
     item_res = await supabase.table("items").select("*") \
-        .eq("id", item_id).eq("user_id", user["id"]).maybe_single().execute()
-    if not item_res.data:
+        .eq("id", item_id).eq("user_id", user["id"]).limit(1).execute()
+    item = _first(item_res)
+    if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
     # Also fetch places so the chatbot knows about them
     places_res = await supabase.table("places").select("name, address") \
         .eq("item_id", item_id).execute()
-    item = dict(item_res.data)
+    item = dict(item)
     item["places"] = places_res.data or []
 
     messages = [{"role": m.role, "content": m.content} for m in body.messages]
@@ -1429,8 +1469,8 @@ async def hype_item(item_id: str, user: dict = Depends(get_current_user)):
     """Add a hype for an item. Idempotent — re-hyping the same item is a no-op."""
     try:
         item_res = await supabase.table("items").select("id, user_id") \
-            .eq("id", item_id).maybe_single().execute()
-        if not item_res.data:
+            .eq("id", item_id).limit(1).execute()
+        if not _first(item_res):
             raise HTTPException(status_code=404, detail="Item not found")
 
         try:
@@ -1448,8 +1488,8 @@ async def hype_item(item_id: str, user: dict = Depends(get_current_user)):
                 raise HTTPException(status_code=500, detail=str(e))
 
         updated = await supabase.table("items").select("hype_count") \
-            .eq("id", item_id).maybe_single().execute()
-        hype_count = (updated.data or {}).get("hype_count", 0)
+            .eq("id", item_id).limit(1).execute()
+        hype_count = (_first(updated) or {}).get("hype_count", 0)
         return {"item_id": item_id, "hype_count": hype_count, "hyped": True}
     except HTTPException:
         raise
@@ -1469,8 +1509,8 @@ async def unhype_item(item_id: str, user: dict = Depends(get_current_user)):
             .eq("user_id", user["id"]) \
             .execute()
         updated = await supabase.table("items").select("hype_count") \
-            .eq("id", item_id).maybe_single().execute()
-        hype_count = (updated.data or {}).get("hype_count", 0)
+            .eq("id", item_id).limit(1).execute()
+        hype_count = (_first(updated) or {}).get("hype_count", 0)
         return {"item_id": item_id, "hype_count": hype_count, "hyped": False}
     except HTTPException:
         raise
@@ -1486,8 +1526,8 @@ async def get_hype_status(item_id: str, user: dict = Depends(get_current_user)):
     """Return current hype_count and whether the current user has hyped this item."""
     try:
         item_res = await supabase.table("items").select("id") \
-            .eq("id", item_id).maybe_single().execute()
-        if not item_res.data:
+            .eq("id", item_id).limit(1).execute()
+        if not _first(item_res):
             raise HTTPException(status_code=404, detail="Item not found")
 
         # If hypes table doesn't exist yet, return defaults instead of crashing
@@ -1499,8 +1539,8 @@ async def get_hype_status(item_id: str, user: dict = Depends(get_current_user)):
 
         try:
             count_res = await supabase.table("items").select("hype_count") \
-                .eq("id", item_id).maybe_single().execute()
-            hype_count = (count_res.data or {}).get("hype_count", 0)
+                .eq("id", item_id).limit(1).execute()
+            hype_count = (_first(count_res) or {}).get("hype_count", 0)
         except Exception:
             hype_count = 0
 
@@ -1528,7 +1568,7 @@ async def get_trending(
 
     try:
         query = supabase.table("items") \
-            .select("*, count", count="exact") \
+            .select("*", count="exact") \
             .eq("is_public", True) \
             .gt("hype_count", 0) \
             .order("hype_count", desc=True)
@@ -1572,8 +1612,15 @@ async def get_trending(
 
     except Exception as e:
         err = str(e).lower()
-        if "hype_count" in err or "is_public" in err or "column" in err:
-            # Tables not set up yet — return empty with migration hint
+        # Only flag migration_pending if the error clearly indicates a missing
+        # column/table — otherwise surface the real error so we don't silently
+        # hide unrelated failures (e.g. malformed queries).
+        looks_like_missing_schema = (
+            ("column" in err and ("hype_count" in err or "is_public" in err))
+            or "relation" in err and "does not exist" in err
+            or "pgrst204" in err
+        )
+        if looks_like_missing_schema:
             return {
                 "items":             [],
                 "total":             0,
@@ -1585,4 +1632,5 @@ async def get_trending(
                     "https://supabase.com/dashboard/project/foktswfeqhzpyrbxzrkm/sql/new"
                 ),
             }
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Trending query failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Trending query failed: {e}")

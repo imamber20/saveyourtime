@@ -147,16 +147,17 @@ export default function HomePage() {
     };
   }, [user?.id, fetchItems]);
 
-  // ── Safety-net poll (10s) ────────────────────────────────────────────────
-  // Falls back to polling when Realtime is not yet enabled for this project.
-  // Once the Realtime DDL above is applied, this poll becomes a no-op
-  // (Realtime events arrive first and are far faster).
+  // ── Aggressive poll (3s) while any item is processing ──────────────────
+  // Primary refresh mechanism — Realtime is a nice-to-have but polling every
+  // 3s ensures processing tiles transition to completed cards quickly without
+  // requiring a manual page refresh.
   useEffect(() => {
-    const hasProcessing = items.some(i => i.source_status === 'processing');
+    const hasProcessing = items.some(i => i.source_status === 'processing')
+      || pendingTiles.some(t => t.status === 'checking');
     if (!hasProcessing) return;
-    const interval = setInterval(fetchItems, 10_000);
+    const interval = setInterval(fetchItems, 3_000);
     return () => clearInterval(interval);
-  }, [items, fetchItems]);
+  }, [items, pendingTiles, fetchItems]);
 
   return (
     <div data-testid="home-page">

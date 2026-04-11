@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Flame, Loader2, TrendingUp, AlertTriangle } from 'lucide-react';
-import { trendingAPI, itemsAPI } from '../services/api';
+import { Flame, Loader2, TrendingUp, AlertTriangle, RefreshCw } from 'lucide-react';
+import { trendingAPI, itemsAPI, formatApiErrorDetail } from '../services/api';
 import EmptyState from '../components/EmptyState';
 
 const VIDEO_PLACEHOLDER = 'https://static.prod-images.emergentagent.com/jobs/7ecda9fa-840f-42b6-a697-5367aaabdf99/images/54cc39fbc674b1e47eb9c19e535e10a091317d4c51804e073bbaf99dac7b9666.png';
@@ -36,9 +36,11 @@ export default function TrendingPage() {
   const [savingId, setSavingId]           = useState(null);
   const [saveMsg, setSaveMsg]             = useState(null);
   const [migrationPending, setMigrationPending] = useState(false);
+  const [fetchError, setFetchError]       = useState(null);
 
   const fetchTrending = useCallback(async () => {
     setLoading(true);
+    setFetchError(null);
     try {
       const { data } = await trendingAPI.list({
         period,
@@ -55,6 +57,12 @@ export default function TrendingPage() {
       if (cats.length) setCategories(cats);
     } catch (err) {
       console.error('Trending fetch failed:', err);
+      const detail = err.response?.data?.detail;
+      const msg = formatApiErrorDetail(detail)
+        || err.message
+        || 'Could not load trending content. Please check your connection and try again.';
+      setFetchError(msg);
+      setItems([]);
     } finally {
       setLoading(false);
     }
@@ -182,6 +190,24 @@ export default function TrendingPage() {
       {loading ? (
         <div className="flex items-center justify-center py-20">
           <Loader2 className="w-8 h-8 text-brand animate-spin" />
+        </div>
+      ) : fetchError ? (
+        <div className="flex flex-col items-center justify-center py-16 px-4 text-center">
+          <div className="w-12 h-12 rounded-full bg-red-50 border border-red-200 flex items-center justify-center mb-4">
+            <AlertTriangle className="w-6 h-6 text-red-500" />
+          </div>
+          <h3 className="font-heading text-lg font-semibold text-text-primary mb-1">
+            Couldn't load trending content
+          </h3>
+          <p className="text-sm text-text-secondary max-w-md mb-4">
+            {fetchError}
+          </p>
+          <button
+            onClick={fetchTrending}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-semibold border border-brand/30 text-brand bg-brand/5 hover:bg-brand/10 transition-colors"
+          >
+            <RefreshCw className="w-4 h-4" /> Try again
+          </button>
         </div>
       ) : items.length === 0 ? (
         <EmptyState
