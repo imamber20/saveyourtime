@@ -28,6 +28,10 @@ export default function HomePage() {
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const realtimeChannelRef = useRef(null);
+  // Tracks which item IDs were processing on the last render so we can detect
+  // when a truly NEW processing item appears and reset the backoff counter.
+  const processingIdsRef = useRef(new Set());
+  const pollCountRef     = useRef(0);
 
   const fetchItems = useCallback(async () => {
     try {
@@ -147,16 +151,36 @@ export default function HomePage() {
     };
   }, [user?.id, fetchItems]);
 
-  // ── Aggressive poll (3s) while any item is processing ──────────────────
-  // Primary refresh mechanism — Realtime is a nice-to-have but polling every
-  // 3s ensures processing tiles transition to completed cards quickly without
-  // requiring a manual page refresh.
+  // ── Exponential-backoff poll while any item is processing ──────────────
+  // Starts fast (3 s) for quick first-result feedback, then backs off to
+  // avoid hammering the server for long-running jobs.
+  // Resets to fast cadence whenever a brand-new processing item appears.
+  //
+  // Schedule: 3 s → 5 s → 10 s → 20 s → 30 s (capped at 30 s)
+  const POLL_DELAYS = [3_000, 5_000, 10_000, 20_000, 30_000];
+
   useEffect(() => {
-    const hasProcessing = items.some(i => i.source_status === 'processing')
-      || pendingTiles.some(t => t.status === 'checking');
-    if (!hasProcessing) return;
-    const interval = setInterval(fetchItems, 3_000);
-    return () => clearInterval(interval);
+    // Build current set of in-flight IDs (DB processing + optimistic tiles)
+    const currentIds = new Set([
+      ...items.filter(i => i.source_status === 'processing').map(i => i.id),
+      ...pendingTiles.filter(t => t.status === 'checking').map(t => String(t.id)),
+    ]);
+
+    // Reset backoff whenever a NEW id appears (just saved a new URL)
+    const hasNewItem = [...currentIds].some(id => !processingIdsRef.current.has(id));
+    if (hasNewItem) pollCountRef.current = 0;
+    processingIdsRef.current = currentIds;
+
+    if (currentIds.size === 0) return; // nothing in flight — stop polling
+
+    const delay = POLL_DELAYS[Math.min(pollCountRef.current, POLL_DELAYS.length - 1)];
+    const timer = setTimeout(async () => {
+      await fetchItems();
+      pollCountRef.current += 1;
+    }, delay);
+
+    return () => clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items, pendingTiles, fetchItems]);
 
   return (

@@ -31,6 +31,43 @@ from services.geocoding import geocode_place
 
 MAX_RETRIES = 3
 
+# ─── Async worker queue (replaces raw BackgroundTasks for process_item) ───────
+# BackgroundTasks run inside the web worker coroutine — under load they compete
+# with request handling and can starve it. A separate queue + worker pool:
+#   • Limits max concurrent heavy jobs (yt-dlp + OpenAI) to WORKER_COUNT
+#   • Decouples processing latency from HTTP response latency
+#   • Gives a clear queue-depth metric for future monitoring
+#
+# Jobs are ALSO persisted in processing_jobs table, so the stuck-job sweeper
+# recovers any in-flight jobs that were lost to a process crash.
+WORKER_COUNT = int(os.environ.get("WORKER_COUNT", "3"))  # tune via env
+
+_job_queue: "asyncio.Queue[tuple]" = None  # type: ignore  — initialised in lifespan
+
+async def enqueue_job(item_id: str, url: str, platform: str, user_id: str):
+    """Push a processing job onto the queue. Non-blocking for the caller."""
+    await _job_queue.put((item_id, url, platform, user_id))
+    logger.info(f"Job queued: {item_id} (queue depth: {_job_queue.qsize()})")
+
+async def _queue_worker(worker_id: int):
+    """Long-lived coroutine: drain jobs from the queue one at a time."""
+    logger.info(f"Worker {worker_id} started")
+    while True:
+        try:
+            args = await _job_queue.get()
+            try:
+                await process_item(*args)
+            except Exception as e:
+                logger.error(f"Worker {worker_id} unhandled error for {args[0]}: {e}")
+            finally:
+                _job_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info(f"Worker {worker_id} shutting down")
+            break
+        except Exception as e:
+            logger.warning(f"Worker {worker_id} loop error: {e}")
+            await asyncio.sleep(1)  # prevent tight error loop
+
 # ─── Rate limiter (in-process, per key+window) ───────────────────────────────
 # Sliding window counters keyed by "<scope>:<ident>". Good enough for single-instance.
 # For multi-instance you swap this out for a Redis INCR+EXPIRE; call sites stay the same.
@@ -141,12 +178,21 @@ async def _stuck_job_sweeper():
                 .lt("started_at", cutoff) \
                 .limit(20).execute()
 
-            for job in (res.data or []):
+            stuck_jobs = res.data or []
+            if not stuck_jobs:
+                await asyncio.sleep(SWEEPER_INTERVAL_SEC)
+                continue
+
+            # Batch-fetch all relevant items in one query instead of N queries
+            stuck_ids = [j["item_id"] for j in stuck_jobs]
+            items_res = await supabase.table("items") \
+                .select("id, url, platform, user_id, retry_count") \
+                .in_("id", stuck_ids).execute()
+            items_by_id = {row["id"]: row for row in (items_res.data or [])}
+
+            for job in stuck_jobs:
                 item_id = job["item_id"]
-                # Re-fetch the item to get url/platform/user_id
-                item_res = await supabase.table("items").select("id, url, platform, user_id, retry_count") \
-                    .eq("id", item_id).limit(1).execute()
-                item = _first(item_res)
+                item = items_by_id.get(item_id)
                 if not item:
                     continue
                 retry_count = item.get("retry_count") or 0
@@ -609,7 +655,7 @@ async def _seed_admin_if_configured():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supabase
+    global supabase, _job_queue
     supabase = await acreate_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     logger.info("Supabase client initialised")
 
@@ -621,15 +667,28 @@ async def lifespan(app: FastAPI):
     except Exception as _mig_err:
         logger.warning(f"Startup migration attempt failed: {_mig_err}")
 
-    # Kick off background workers (stuck-job sweeper; processing loop is still inline via BackgroundTasks)
-    try:
-        asyncio.create_task(_stuck_job_sweeper())
-    except Exception as _w_err:
-        logger.warning(f"Background sweeper failed to start: {_w_err}")
+    # Start async worker queue
+    _job_queue = asyncio.Queue()
+    _workers = [asyncio.create_task(_queue_worker(i)) for i in range(WORKER_COUNT)]
+    logger.info(f"Started {WORKER_COUNT} processing workers")
+
+    # Start stuck-job sweeper
+    asyncio.create_task(_stuck_job_sweeper())
 
     logger.info(f"Content Memory API started (APP_ENV={APP_ENV})")
     yield
-    # supabase-py HTTP client cleans up automatically
+
+    # Graceful shutdown: drain the queue then cancel workers
+    if not _job_queue.empty():
+        logger.info(f"Draining {_job_queue.qsize()} queued jobs before shutdown…")
+        try:
+            await asyncio.wait_for(_job_queue.join(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.warning("Queue drain timed out — some jobs may re-run via sweeper")
+    for w in _workers:
+        w.cancel()
+    await asyncio.gather(*_workers, return_exceptions=True)
+    logger.info("Workers shut down")
 
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -915,7 +974,7 @@ async def check_url_endpoint(url: str, user: dict = Depends(get_current_user)):
 
 # ─── Save Flow ────────────────────────────────────────────────────────────────
 @app.post("/api/save")
-async def save_url(req: SaveRequest, request: Request, background_tasks: BackgroundTasks,
+async def save_url(req: SaveRequest, request: Request,
                    user: dict = Depends(get_current_user)):
     # Abuse control — limit saves per user and per IP independently
     _enforce_rate_limit("save_user", user["id"],          limit=60, window_sec=3600)
@@ -992,7 +1051,7 @@ async def save_url(req: SaveRequest, request: Request, background_tasks: Backgro
         "completed_at": None,
     }).execute()
 
-    background_tasks.add_task(process_item, item_id, url, platform, user["id"])
+    await enqueue_job(item_id, url, platform, user["id"])
     return {"item_id": item_id, "status": "processing"}
 
 
@@ -1192,65 +1251,88 @@ async def process_item(item_id: str, url: str, platform: str, user_id: str):
             "source_status":      "completed",
         })
 
-        # ── Step 4b: Embedding generation (for global chat vector search) ───────
-        try:
-            from services.ai_service import generate_embedding
-            embed_text = " ".join(filter(None, [
-                ai_result.get("title") or metadata.get("title", ""),
-                ai_result.get("summary", ""),
-                ai_result.get("category", ""),
-                " ".join(ai_result.get("key_points", [])[:5]),
-                ai_result.get("transcript_excerpt", "")[:300],
-            ]))
-            if embed_text.strip():
-                embedding = await generate_embedding(embed_text)
-                if embedding:
-                    await update_item_fields({"embedding": embedding})
-                    logger.info(f"Embedding stored for {item_id}")
-        except Exception as e:
-            logger.warning(f"Embedding generation skipped for {item_id}: {e}")
+        # ── Steps 4b + 5 + 6: Run embedding, geocoding, collection-assign in parallel ──
+        # None of these depend on each other — all need only the AI result.
+        # Geocoding places is further parallelised with a semaphore-limited gather.
+        await update_job({"step_name": "enrichment"})
 
-        # ── Step 5: Geocoding ─────────────────────────────────────────────────
-        # Clear any previously-geocoded places for this item so retries don't
-        # produce duplicates (e.g. the same hostel inserted twice on re-processing).
-        try:
-            await supabase.table("places").delete().eq("item_id", item_id).execute()
-        except Exception as e:
-            logger.warning(f"Could not clear existing places for {item_id}: {e}")
+        async def _do_embedding():
+            try:
+                from services.ai_service import generate_embedding
+                embed_text = " ".join(filter(None, [
+                    ai_result.get("title") or metadata.get("title", ""),
+                    ai_result.get("summary", ""),
+                    ai_result.get("category", ""),
+                    " ".join(ai_result.get("key_points", [])[:5]),
+                    ai_result.get("transcript_excerpt", "")[:300],
+                ]))
+                if embed_text.strip():
+                    embedding = await asyncio.wait_for(
+                        generate_embedding(embed_text), timeout=20
+                    )
+                    if embedding:
+                        await update_item_fields({"embedding": embedding})
+                        logger.info(f"Embedding stored for {item_id}")
+            except Exception as e:
+                logger.warning(f"Embedding skipped for {item_id}: {e}")
 
-        if ai_result.get("is_place_related") and ai_result.get("places"):
-            await update_job({"step_name": "geocoding"})
-            # Build context hint for disambiguation (e.g. "Kyoto travel reel")
+        # Geocoding: clear stale places then fan-out all places concurrently
+        # (semaphore caps at 3 so we don't hammer Nominatim's 1 req/s limit)
+        _geo_sem = asyncio.Semaphore(3)
+
+        async def _geocode_one(place_entry: str, item_context: str):
+            async with _geo_sem:
+                try:
+                    display_name = (
+                        place_entry.split(",")[0].strip() if "," in place_entry else place_entry
+                    )
+                    coords = await asyncio.wait_for(
+                        geocode_place(place_entry, context=item_context), timeout=10
+                    )
+                    if coords:
+                        await supabase.table("places").insert({
+                            "item_id":        item_id,
+                            "name":           display_name,
+                            "address":        coords.get("address", ""),
+                            "latitude":       coords["lat"],
+                            "longitude":      coords["lon"],
+                            "geocode_source": coords.get("source", "nominatim"),
+                            "created_at":     now(),
+                        }).execute()
+                except Exception as e:
+                    logger.warning(f"Geocoding failed for '{place_entry}': {e}")
+
+        async def _do_geocoding():
+            try:
+                await supabase.table("places").delete().eq("item_id", item_id).execute()
+            except Exception as e:
+                logger.warning(f"Could not clear existing places for {item_id}: {e}")
+
+            if not (ai_result.get("is_place_related") and ai_result.get("places")):
+                return
+
             item_context = " ".join(filter(None, [
                 metadata.get("title", ""),
                 ai_result.get("category", ""),
                 ai_result.get("sub_category", ""),
             ]))[:120]
 
-            # Deduplicate place entries (case-insensitive) within a single run
-            seen_places = set()
-            for place_entry in ai_result["places"][:15]:
-                key = place_entry.strip().lower()
-                if key in seen_places:
-                    continue
-                seen_places.add(key)
-                display_name = (
-                    place_entry.split(",")[0].strip() if "," in place_entry else place_entry
-                )
-                coords = await geocode_place(place_entry, context=item_context)
-                if coords:
-                    await supabase.table("places").insert({
-                        "item_id":        item_id,
-                        "name":           display_name,
-                        "address":        coords.get("address", ""),
-                        "latitude":       coords["lat"],
-                        "longitude":      coords["lon"],
-                        "geocode_source": coords.get("source", "nominatim"),
-                        "created_at":     now(),
-                    }).execute()
+            # Deduplicate place entries before fanning out
+            seen: set = set()
+            unique_places = []
+            for p in ai_result["places"][:15]:
+                k = p.strip().lower()
+                if k not in seen:
+                    seen.add(k)
+                    unique_places.append(p)
 
-        # ── Step 6: Auto-assign to collection ────────────────────────────────
-        await auto_assign_to_collection(item_id, user_id, ai_result)
+            await asyncio.gather(*[_geocode_one(p, item_context) for p in unique_places])
+
+        async def _do_collection():
+            await auto_assign_to_collection(item_id, user_id, ai_result)
+
+        # All three post-AI enrichments run concurrently
+        await asyncio.gather(_do_embedding(), _do_geocoding(), _do_collection())
 
         await update_job({"status": "completed", "step_name": "done", "completed_at": now()})
         logger.info(f"Processing complete for item {item_id}")
@@ -1609,7 +1691,7 @@ async def get_categories(user: dict = Depends(get_current_user)):
 
 # ─── Retry Processing ─────────────────────────────────────────────────────────
 @app.post("/api/items/{item_id}/retry")
-async def retry_processing(item_id: str, request: Request, background_tasks: BackgroundTasks,
+async def retry_processing(item_id: str, request: Request,
                            user: dict = Depends(get_current_user)):
     _enforce_rate_limit("retry_user", user["id"], limit=20, window_sec=3600)
     res = await supabase.table("items").select("*") \
@@ -1662,7 +1744,7 @@ async def retry_processing(item_id: str, request: Request, background_tasks: Bac
             {"item_id": item_id, **job_fields}
         ).execute()
 
-    background_tasks.add_task(process_item, item_id, item["url"], item["platform"], user["id"])
+    await enqueue_job(item_id, item["url"], item["platform"], user["id"])
     return {
         "message":          "Processing restarted",
         "retry_count":      retry_count + 1,
