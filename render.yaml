@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: saveyourtime-backend
+    runtime: python
+    region: oregon
+    plan: free
+    repo: https://github.com/imamber20/saveyourtime.git
+    branch: main
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "1"
+      - key: SUPABASE_URL
+        value: https://foktswfeqhzpyrbxzrkm.supabase.co
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: BRAVE_API_KEY
+        sync: false
+      - key: HERE_API_KEY
+        sync: false
+      - key: HERE_APP_ID
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.0"
